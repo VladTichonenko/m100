@@ -38,7 +38,16 @@ CREATE TABLE IF NOT EXISTS table_selections (
     user_id BIGINT, chat_id BIGINT, spreadsheet_id TEXT, sheet_name TEXT,
     payload JSONB NOT NULL, PRIMARY KEY (user_id, chat_id, spreadsheet_id, sheet_name)
 );
+CREATE TABLE IF NOT EXISTS telegram_updates (
+    update_id BIGINT PRIMARY KEY, payload JSONB NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS telegram_updates_pending ON telegram_updates (update_id)
+    WHERE completed_at IS NULL;
 INSERT INTO schema_migrations VALUES (1) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations VALUES (2) ON CONFLICT DO NOTHING;
 """
 
 
@@ -62,6 +71,35 @@ class Store:
     def try_acquire_writer(self, project: str) -> bool:
         key = int.from_bytes(hashlib.sha256(project.encode()).digest()[:8], signed=True)
         return self.db.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()[0]
+
+    def enqueue_update(self, update: dict) -> None:
+        self.db.execute(
+            "INSERT INTO telegram_updates(update_id,payload) VALUES (%s,%s) "
+            "ON CONFLICT(update_id) DO NOTHING",
+            (update["update_id"], Jsonb(update)),
+        )
+
+    def pending_update(self) -> tuple | None:
+        return self.db.execute(
+            "SELECT update_id,payload,attempts FROM telegram_updates "
+            "WHERE completed_at IS NULL AND retry_at<=%s ORDER BY update_id LIMIT 1",
+            (time.time(),),
+        ).fetchone()
+
+    def finish_update(self, update_id: int) -> None:
+        # Retain only the ID for deduplication once personal message data is no longer needed.
+        self.db.execute(
+            "UPDATE telegram_updates SET completed_at=clock_timestamp(),payload='{}'::jsonb "
+            "WHERE update_id=%s",
+            (update_id,),
+        )
+        self.db.execute("DELETE FROM telegram_updates WHERE completed_at<now()-interval '7 days'")
+
+    def retry_update(self, update_id: int, attempts: int) -> None:
+        self.db.execute(
+            "UPDATE telegram_updates SET attempts=attempts+1,retry_at=%s WHERE update_id=%s",
+            (time.time() + min(300, 2 ** min(attempts + 1, 9)), update_id),
+        )
 
     def acquire_writer(self, project: str) -> None:
         """One Telegram consumer/writer per source table, even across different machines."""

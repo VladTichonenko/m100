@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,8 @@ class Settings(BaseSettings):
     )
 
     telegram_bot_token: SecretStr = SecretStr("")
+    telegram_mode: str = "polling"
+    telegram_webhook_secret: SecretStr = SecretStr("")
     allowed_user_ids: str = ""
     google_spreadsheet_id: str = "16S1KKEV-8CmRLbasQN6WB1NOfUpJs9oFywIGPZXixZs"
     google_sheet_name: str = "Лист1"
@@ -59,6 +62,15 @@ class Settings(BaseSettings):
 
     def problems(self) -> list[str]:
         problems = []
+        if self.telegram_mode not in {"polling", "webhook"}:
+            problems.append("TELEGRAM_MODE: выберите polling или webhook")
+        if self.telegram_mode == "webhook":
+            if not self.web_enabled or not self.web_base_url.startswith("https://"):
+                problems.append("Для вебхука нужны WEB_ENABLED=true и HTTPS WEB_BASE_URL")
+            if not re.fullmatch(
+                r"[A-Za-z0-9_-]{32,256}", self.telegram_webhook_secret.get_secret_value()
+            ):
+                problems.append("TELEGRAM_WEBHOOK_SECRET: 32–256 символов A-Z, a-z, 0-9, _ и -")
         if not self.database_dsn:
             problems.append("Не задан DATABASE_URL PostgreSQL")
         if not self.telegram_bot_token.get_secret_value():

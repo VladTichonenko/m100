@@ -200,16 +200,21 @@ uv run python scripts/browser_sandbox.py
 
 ## 8. Railway
 
-В репозитории подготовлены `Dockerfile`, `railway.json`, `/healthz`, поддержка `PORT`,
+В репозитории подготовлены `Dockerfile`, `.railway/railway.ts`, `/healthz`, поддержка `PORT`,
 `DATABASE_URL`, Google-ключа из секретной переменной и PostgreSQL-блокировки писателя.
-Автоматическая публикация пока не выполнена: подключение Railway запросило повторную авторизацию.
+Целевой проект: [M100](https://railway.com/project/df1cf821-dfa0-4222-a0c5-81a472e2cc6b),
+рабочее пространство Test Test's Projects. Адрес: https://m100-production.up.railway.app.
+Сервисы: `m100` (бот + сайт) и `Postgres` (постоянный том, приватная сеть).
+Автодеплой: `main` → GitHub Actions `Checks` → Railway с включённым Wait for CI.
 
 1. Создайте проект и PostgreSQL в Railway, сервис приложения — из этого репозитория,
    корень сборки — корень проекта, сборщик — Dockerfile.
 2. В переменные приложения внесите секреты из локального `.env` через защищённую форму,
    `DATABASE_URL=${{Postgres.DATABASE_URL}}` (имя сервиса БД должно совпадать),
    `GOOGLE_CREDENTIALS_JSON` = полное содержимое ключа, `GOOGLE_CREDENTIALS_FILE` = пусто.
-3. `WEB_HOST=0.0.0.0`, `WEB_AUTO_OPEN=false`, `WEB_ENABLED=true`. Порт берётся из `PORT`.
+3. `WEB_HOST=0.0.0.0`, `WEB_AUTO_OPEN=false`, `WEB_ENABLED=true`, `PORT=8080`.
+   `TELEGRAM_MODE=webhook`, случайный `TELEGRAM_WEBHOOK_SECRET` длиной 32–256 символов.
+   Сервер сам регистрирует HTTPS-вебхук; секрет не должен совпадать с токеном бота.
 4. Одна реплика приложения. Новая копия стартует в состоянии `starting`, блокирует
    изменения и ждёт освобождения писателя; после остановки старой становится `ok`.
 5. Сгенерируйте HTTPS-домен приложения и задайте его как `WEB_BASE_URL`.
@@ -217,7 +222,11 @@ uv run python scripts/browser_sandbox.py
    резервную копию/восстановление PostgreSQL в пустую целевую базу при остановленном боте.
 6. Перед запуском Railway-копии остановите локального бота с тем же Telegram-токеном.
    Блокировка в одной БД не защищает две независимые базы от работы с одним Telegram-ботом.
-7. Откройте `<ваш-домен>/healthz`, дождитесь `status=ok`; получите НОВУЮ ссылку `/report`
+7. Откройте `<ваш-домен>/healthz`, дождитесь `status=ok`.
+   POST `/telegram/webhook` без секретного заголовка должен вернуть 401;
+   GET `/api/reports/unknown` без персонального токена — 401.
+   В Telegram `getWebhookInfo`: правильный HTTPS-адрес, нет ошибки доставки;
+    получите НОВУЮ ссылку `/report`
    в боте, откройте с телефона без компьютера и повторите раздел 7.
 8. Перезапустите Railway-сервис: черновики должны остаться. Включите резервные копии
    PostgreSQL и проверьте восстановление в отдельную базу.

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 import sys
 from datetime import datetime
 
@@ -16,7 +17,48 @@ from .llm import LLM
 from .service import Reports
 from .sheets import Sheets
 from .store import Store
+from .telegram_webhook import PATH, consume_updates
 from .web import start_web
+
+
+async def run_webhook(reports: Reports, dispatcher: Dispatcher, bot: Bot) -> None:
+    stopped = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stopped.set)
+    worker = None
+    waiter = None
+    try:
+        await dispatcher.emit_startup(bot=bot)
+        await bot.set_webhook(
+            reports.settings.web_base_url.rstrip("/") + PATH,
+            secret_token=reports.settings.telegram_webhook_secret.get_secret_value(),
+            allowed_updates=["message", "callback_query"],
+            max_connections=1,
+            drop_pending_updates=False,
+        )
+        logging.getLogger(__name__).info("Telegram webhook enabled")
+        worker = asyncio.create_task(consume_updates(reports, dispatcher, bot, stopped))
+        waiter = asyncio.create_task(stopped.wait())
+        done, _ = await asyncio.wait([worker, waiter], return_when=asyncio.FIRST_COMPLETED)
+        if worker in done:
+            worker.result()
+    finally:
+        reports.writer_ready = False
+        stopped.set()
+        if worker and not worker.done():
+            # Finish the current update before releasing the writer lease during a deploy.
+            try:
+                await asyncio.wait_for(asyncio.shield(worker), timeout=25)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Webhook drain: %s", type(exc).__name__)
+        for task in (worker, waiter):
+            if task:
+                task.cancel()
+        await asyncio.gather(*(task for task in (worker, waiter) if task), return_exceptions=True)
+        await dispatcher.emit_shutdown(bot=bot)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
 
 
 async def run(settings: Settings) -> None:
@@ -47,11 +89,20 @@ async def run(settings: Settings) -> None:
                         raise RuntimeError("Writer lease did not become available")
                     reports.writer_ready = True
                     await configure_menu(bot)
-                    await dispatcher.start_polling(
-                        bot,
-                        handle_as_tasks=False,
-                        allowed_updates=["message", "callback_query"],
-                    )
+                    if settings.telegram_mode == "webhook":
+                        await run_webhook(reports, dispatcher, bot)
+                    else:
+                        if (await bot.get_webhook_info()).url:
+                            from .domain import UserError
+
+                            raise UserError(
+                                "Для бота уже настроен вебхук. Локальный polling не запускается."
+                            )
+                        await dispatcher.start_polling(
+                            bot,
+                            handle_as_tasks=False,
+                            allowed_updates=["message", "callback_query"],
+                        )
                 finally:
                     if web_runner:
                         await web_runner.cleanup()

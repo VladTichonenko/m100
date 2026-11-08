@@ -1,0 +1,8 @@
+{
+  "name": "m100-infrastructure",
+  "private": true,
+  "description": "Railway infrastructure configuration; application frontend lives in web/",
+  "devDependencies": {
+    "railway": "^3.16.0"
+  }
+}

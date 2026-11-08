@@ -387,6 +387,10 @@ def create_app(
         return web.FileResponse(path)
 
     app = web.Application(middlewares=[errors], client_max_size=128 * 1024)
+    if reports.settings.telegram_mode == "webhook":
+        from .telegram_webhook import register_webhook
+
+        register_webhook(app, reports)
     app.router.add_get("/healthz", health)
     app.router.add_get("/api/reports/{id}", get_report)
     app.router.add_get("/api/reports/{id}/avatar", avatar)
