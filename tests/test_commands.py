@@ -204,6 +204,7 @@ async def test_voice_edit_shows_transcription_and_remembers_it(conversation, mon
 
     async def transcribe(*args):
         assert [method.text for method in c.session.sent] == ["Слушаю"]
+        assert c.session.sent[0].reply_markup is None
         assert not c.session.edited
         return text
 
@@ -227,7 +228,8 @@ async def test_voice_edit_shows_transcription_and_remembers_it(conversation, mon
     assert len(c.session.edited) == 1
     assert c.session.edited[0].message_id == 1
     assert c.session.edited[0].parse_mode == "HTML"
-    assert_work_links(c.session.edited[0], c.reports, original)
+    assert c.session.edited[0].reply_markup is None
+    assert_work_links(c.session.sent[-1], c.reports, original)
     assert c.reports.store.history(7, 7)[0]["content"] == text
     assert c.session.sent[-1].reply_markup.inline_keyboard[0][0].text == "Открыть отчёт"
     assert c.reports.store.get_draft(original.id, 7).lines[0].quantity == 20
@@ -245,6 +247,7 @@ async def test_ambiguous_voice_asks_once_without_creating_fake_work(conversation
     assert len(c.session.sent) == 2
     assert c.session.sent[0].text == "Слушаю"
     assert c.session.edited[0].text == "🎙 Расшифровка:\n\n<blockquote>Исправь это</blockquote>"
+    assert c.session.edited[0].reply_markup is None
     assert c.session.sent[1].text == "Какую работу изменить?"
     assert_work_links(c.session.sent[1], c.reports)
     assert c.reports.store.active_draft(7) is None
@@ -401,6 +404,7 @@ async def test_voice_failure_replaces_listening_status(conversation, monkeypatch
     assert len(c.session.edited) == 1
     error = c.session.edited[0]
     assert error.message_id == 1 and error.parse_mode is None
+    assert error.reply_markup is None
     assert "Не удалось" in error.text and "private-download-url" not in error.text
     c.llm.command.assert_not_awaited()
     assert c.reports.store.history(7, 7) == []
@@ -423,7 +427,7 @@ async def test_long_voice_transcript_is_shown_in_full(conversation, monkeypatch)
         quoted = m.text.removeprefix("🎙 Расшифровка:\n\n")
         assert quoted.startswith("<blockquote>") and quoted.endswith("</blockquote>")
         decoded.append(unescape(quoted.removeprefix("<blockquote>").removesuffix("</blockquote>")))
-        assert_work_links(m, c.reports)
+        assert m.reply_markup is None
     assert "".join(decoded) == text
     assert all(len(part.encode("utf-16-le")) // 2 + 20 <= 4096 for part in decoded)
     assert all(m.parse_mode == "HTML" for m in transcript)

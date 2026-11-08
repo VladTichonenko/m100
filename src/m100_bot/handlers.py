@@ -477,7 +477,6 @@ def build_router(reports: Reports) -> Router:
                 await status.edit_text(
                     str(exc),
                     parse_mode=None,
-                    reply_markup=work_keyboard(reports, message.from_user.id),
                 )
                 return
             except Exception as exc:
@@ -485,7 +484,6 @@ def build_router(reports: Reports) -> Router:
                 await status.edit_text(
                     "Не удалось обработать голосовое. Попробуйте ещё раз или отправьте текст.",
                     parse_mode=None,
-                    reply_markup=work_keyboard(reports, message.from_user.id),
                 )
                 return
             # Even emoji occupy at most two UTF-16 units: leave room for the heading
@@ -494,13 +492,11 @@ def build_router(reports: Reports) -> Router:
             await status.edit_text(
                 f"🎙 Расшифровка:\n\n<blockquote>{escape(parts[0])}</blockquote>",
                 parse_mode="HTML",
-                reply_markup=work_keyboard(reports, message.from_user.id),
             )
             for part in parts[1:]:
                 await message.answer(
                     f"<blockquote>{escape(part)}</blockquote>",
                     parse_mode="HTML",
-                    reply_markup=work_keyboard(reports, message.from_user.id),
                 )
             await process_command(message, text, voice=True)
 
