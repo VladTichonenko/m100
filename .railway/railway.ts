@@ -10,10 +10,8 @@ export default defineRailway(() => {
     healthcheck: "/healthz",
     healthcheckTimeout: 180,
     replicas: { "iad": 1 },
-    deploy: {
-      drainingSeconds: 30, overlapSeconds: 0, sleepApplication: false,
-      restartPolicyType: "ON_FAILURE", restartPolicyMaxRetries: 10,
-    },
+    // Railway defaults keep serverless disabled and restart on failure (10 retries).
+    deploy: { drainingSeconds: 30, overlapSeconds: 0 },
   });
 
   return project("M100", {
