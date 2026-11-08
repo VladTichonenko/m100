@@ -224,7 +224,8 @@ async def test_voice_edit_shows_transcription_and_remembers_it(conversation, mon
     await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     messages = [method.text for method in c.session.sent]
     assert len(messages) == 2 and messages[0] == "Слушаю"
-    assert "20 м" in messages[1]
+    assert "1 позиций" in messages[1]
+    assert "кабель 10 метров" not in messages[1]
     assert len(c.session.edited) == 1
     assert c.session.edited[0].message_id == 1
     assert c.session.edited[0].parse_mode == "HTML"
@@ -284,7 +285,7 @@ async def test_followup_clarification_uses_current_report_and_keeps_links(
     elif unresolved:
         assert "Уточните сечение кабеля" in c.session.sent[-1].text
     else:
-        assert "10 м" in c.session.sent[-1].text
+        assert "1 позиций" in c.session.sent[-1].text
     c.llm.command.assert_not_awaited()
     assert_work_links(c.session.sent[-1], c.reports, draft)
     assert c.reports.store.get_draft(draft.id, 7) == draft
@@ -448,7 +449,10 @@ async def test_oversized_voice_is_rejected_without_listening(conversation, monke
     c.llm.command.assert_not_awaited()
 
 
-async def test_missing_parameter_is_named_with_voice_and_manual_options(conversation):
+@pytest.mark.parametrize("spoken", [False, True])
+async def test_missing_parameter_is_named_without_repeating_transcript(
+    conversation, monkeypatch, spoken
+):
     c = conversation
     c.llm.command.return_value = VoiceCommand(
         action="add", edits=[], additions="кабель 15 метров", question=""
@@ -461,14 +465,66 @@ async def test_missing_parameter_is_named_with_voice_and_manual_options(conversa
             question="Не указано сечение кабеля. Какое сечение нужно записать?",
         )
     ]
-    await c.send("Запиши кабель 15 метров")
+    text = "Запиши кабель 15 метров"
+    if spoken:
+        monkeypatch.setattr(Voice, "transcribe", AsyncMock(return_value=text))
+        monkeypatch.setattr(c.bot, "download", AsyncMock())
+        await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
+        assert c.session.edited[0].text == f"🎙 Расшифровка:\n\n<blockquote>{text}</blockquote>"
+        assert c.session.edited[0].reply_markup is None
+    else:
+        await c.send(text)
     messages = [method.text for method in c.session.sent]
-    assert len(messages) == 1
-    clarification = messages[0]
-    assert "кабель 15 метров" in clarification
+    assert len(messages) == 1 + int(spoken)
+    clarification = messages[-1]
+    assert "кабель 15 метров" not in clarification
+    assert "Позиция 1" in clarification
     assert "сечение кабеля" in clarification
     buttons = [button for row in c.session.sent[-1].reply_markup.inline_keyboard for button in row]
     assert [button.text for button in buttons] == ["Открыть отчёт", "Открыть таблицу"]
+    c.reports.sheets.apply.assert_not_awaited()
+
+
+@pytest.mark.parametrize("over_estimate", [False, True])
+async def test_voice_draft_does_not_repeat_transcribed_lines(
+    conversation, monkeypatch, over_estimate
+):
+    c = conversation
+    snapshot = c.reports.sheets.snapshot.return_value
+    snapshot.positions["cable"] = snapshot.positions["cable"].model_copy(
+        update={
+            "name": "Сезонный переключатель СП-102",
+            "unit": "шт",
+            "planned": 1 if over_estimate else 100,
+        }
+    )
+    phrases = ["Сезонный переключатель две штуки.", "Ещё две."]
+    text = " ".join(phrases) + " Сразу сохраняй."
+    c.llm.command.return_value = VoiceCommand(
+        action="add", edits=[], additions=text, question="", save_immediately=False
+    )
+    c.llm.extract.return_value = [
+        Line(phrase=phrase, position_id="cable", quantity=2, unit="шт") for phrase in phrases
+    ]
+    monkeypatch.setattr(Voice, "transcribe", AsyncMock(return_value=text))
+    monkeypatch.setattr(c.bot, "download", AsyncMock())
+    await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 4})
+    assert [m.text for m in c.session.sent[:1]] == ["Слушаю"]
+    assert len(c.session.sent) == 2 and len(c.session.edited) == 1
+    assert c.session.edited[0].text == f"🎙 Расшифровка:\n\n<blockquote>{text}</blockquote>"
+    assert c.session.edited[0].reply_markup is None
+    answer = c.session.sent[-1]
+    assert all(phrase not in answer.text for phrase in phrases)
+    assert "2 позиций" in answer.text and "Скажите «сохрани»" in answer.text
+    if over_estimate:
+        assert "Сезонный переключатель СП-102" in answer.text
+        assert "превышение после записи — 3 шт" in answer.text
+        assert "подтвердите сохранение" in answer.text
+    else:
+        assert "превышение" not in answer.text
+    draft = c.reports.active_draft(7)
+    assert [line.phrase for line in draft.lines] == phrases
+    assert_work_links(answer, c.reports, draft)
     c.reports.sheets.apply.assert_not_awaited()
 
 

@@ -66,16 +66,16 @@ def work_keyboard(
 
 def issue_text(draft: Draft, limit: int = 2) -> str:
     issues = [
-        line
-        for line in draft.lines
+        (index, line)
+        for index, line in enumerate(draft.lines, 1)
         if not line.deleted and (not line.position_id or line.quantity is None or line.question)
     ]
     texts = []
-    for line in issues[:limit]:
+    for index, line in issues[:limit]:
         question = line.question or (
             "Уточните позицию." if not line.position_id else "Какой выполненный объём?"
         )
-        texts.append(f"{escape(line.phrase[:120])}: {escape(question[:450])}")
+        texts.append(f"Позиция {index}: {escape(question[:450])}")
     if len(issues) > limit:
         texts.append(f"Ещё требуют уточнения: {len(issues) - limit}. Подробности в отчёте.")
     return "\n".join(texts)
@@ -180,13 +180,6 @@ async def show_draft(message, draft: Draft, reports: Reports, *, notice: str = "
             text += "\nПосле уточнения сохраню сразу."
     else:
         text = f"Черновик за {draft.day:%d.%m.%Y}: {len(draft.lines)} позиций."
-        for line in draft.lines[:3]:
-            text += (
-                f"\n{escape(line.phrase[:120])} — "
-                f"{fmt(line.quantity or 0)} {escape(line.unit or '')}"
-            )
-        if len(draft.lines) > 3:
-            text += f"\nЕщё {len(draft.lines) - 3} — в отчёте."
         text += "\nСкажите «сохрани» или проверьте отчёт."
     if draft.status == "draft":
         snapshot = await reports.sheets.snapshot(draft.day)
