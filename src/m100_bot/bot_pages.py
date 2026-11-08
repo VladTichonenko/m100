@@ -3,11 +3,12 @@
 from html import escape
 from urllib.parse import urlsplit
 
-from aiogram.types import InlineKeyboardButton, LinkPreviewOptions
+from aiogram.types import InlineKeyboardButton, InputRichMessage, LinkPreviewOptions
 
 from .access import ROLE_NAMES
 from .domain import Draft, UserError, fmt
 from .navigation import help_page, main_keyboard
+from .queries import table_html
 from .service import Reports
 from .ui import keyboard, report_button, show_draft, table_button, work_keyboard
 
@@ -143,16 +144,14 @@ class BotPages:
         ]
         if not positions:
             raise UserError("Позиции не найдены. Попробуйте /remaining кабель или ID из таблицы.")
-        text = "📐 <b>Остатки по спецификации</b>\n"
-        for p in positions:
-            line = (
-                f"\n{escape(p.id)} · {escape(p.name)}\n<b>{fmt(p.remaining)} {escape(p.unit)}</b>\n"
-            )
-            if len(text) + len(line) > 3500:
-                await message.answer(text, reply_markup=work_keyboard(reports, user_id))
-                text = ""
-            text += line
-        await message.answer(text, reply_markup=work_keyboard(reports, user_id))
+        text = table_html(
+            "📐 <b>Остатки по спецификации</b>",
+            ["ID", "Работа", "Осталось"],
+            [[p.id, p.name, f"{fmt(p.remaining)} {p.unit}"] for p in positions],
+        )
+        await message.answer_rich(
+            InputRichMessage(html=text), reply_markup=work_keyboard(reports, user_id)
+        )
 
     async def navigate(self, message, user_id: int, chat_id: int, action: str, section="overview"):
         reports = self.reports

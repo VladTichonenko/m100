@@ -45,6 +45,7 @@ class TelegramSession(BaseSession):
         self.sent = []
         self.documents = []
         self.edited = []
+        self.rich = []
 
     async def close(self):
         pass
@@ -53,6 +54,13 @@ class TelegramSession(BaseSession):
         yield b""
 
     async def make_request(self, bot, method, timeout=None):
+        if method.__api_method__ == "sendRichMessage":
+            self.rich.append(method)
+            return Message(
+                message_id=2000 + len(self.rich),
+                date=datetime.now(UTC),
+                chat=Chat(id=7, type="private"),
+            ).as_(bot)
         if method.__api_method__ == "editMessageText":
             self.edited.append(method)
             return Message(
@@ -350,7 +358,8 @@ async def test_save_failure_keeps_retry_and_work_links(conversation):
     assert message.reply_markup.inline_keyboard[0][0].text == "Повторить сохранение"
 
 
-async def test_remaining_links_appear_on_every_message(conversation):
+@pytest.mark.parametrize("mode", ["command", "text", "voice"])
+async def test_remaining_is_one_native_table_with_work_links(conversation, monkeypatch, mode):
     c = conversation
     draft = await c.reports.create(7, 7, "кабель 10 метров")
     positions = c.reports.sheets.snapshot.return_value.positions
@@ -360,10 +369,20 @@ async def test_remaining_links_appear_on_every_message(conversation):
             update={"id": f"work{i}", "name": f"Работа {i}: " + "наружный блок " * 6}
         )
         positions[position.id] = position
-    await c.send("/remaining")
-    assert len(c.session.sent) > 1
-    for message in c.session.sent:
-        assert_work_links(message, c.reports, draft)
+    if mode == "voice":
+        monkeypatch.setattr(Voice, "transcribe", AsyncMock(return_value="Покажи остатки"))
+        monkeypatch.setattr(c.bot, "download", AsyncMock())
+        await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
+        assert c.session.edited[0].reply_markup is None
+    else:
+        await c.send("/remaining" if mode == "command" else "Покажи остатки")
+    assert len(c.session.rich) == 1 and not c.session.documents
+    assert len(c.session.sent) == int(mode == "voice")
+    message = c.session.rich[0]
+    assert message.rich_message.html.count("<tr>") == len(positions) + 1
+    assert "Работа 59:" in message.rich_message.html
+    assert_work_links(message, c.reports, draft)
+    c.llm.command.assert_not_awaited()
     c.reports.sheets.apply.assert_not_awaited()
 
 
@@ -903,17 +922,22 @@ async def test_table_question_answers_once_with_values_and_leaves_draft_untouche
         await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     else:
         await c.send(text)
-    assert len(c.session.sent) == 1 + int(voice) and not c.session.documents
-    assert "100 м" in c.session.sent[-1].text
-    assert "Открыть источник" == c.session.sent[-1].reply_markup.inline_keyboard[0][0].text
-    assert_work_links(c.session.sent[-1], c.reports, pending)
+    assert len(c.session.sent) == int(voice) and not c.session.documents
+    assert len(c.session.rich) == 1
+    answer = c.session.rich[0]
+    assert "100 м" in answer.rich_message.html and "<table" in answer.rich_message.html
+    assert "Открыть источник" == answer.reply_markup.inline_keyboard[0][0].text
+    assert_work_links(answer, c.reports, pending)
+    assert "100 м" in c.reports.store.history(7, 7)[-1]["content"]
+    if voice:
+        assert c.session.edited[0].reply_markup is None
     assert c.reports.active_draft(7) == pending
     c.reports.sheets.snapshot.assert_awaited_once()
     c.reports.sheets.apply.assert_not_awaited()
     c.llm.extract.assert_not_awaited()
 
 
-async def test_large_table_query_sends_single_document_instead_of_message_spam(conversation):
+async def test_large_table_query_sends_one_native_table_instead_of_document(conversation):
     from m100_bot.queries import TableQuery
 
     c = conversation
@@ -927,11 +951,11 @@ async def test_large_table_query_sends_single_document_instead_of_message_spam(c
         action="query", edits=[], additions="", question="", query=TableQuery(metrics=["remaining"])
     )
     await c.send("Покажи остатки по всем работам")
-    assert len(c.session.documents) == 1 and len(c.session.sent) == 0
-    document = c.session.documents[0]
-    assert_work_links(document, c.reports)
-    assert document.document.filename.endswith(".csv") and b"work19" in document.document.data
-    assert len(document.caption) < 1024
+    assert len(c.session.rich) == 1 and not c.session.documents and not c.session.sent
+    answer = c.session.rich[0]
+    assert_work_links(answer, c.reports)
+    assert answer.rich_message.html.count("<tr>") == 22
+    assert "work19" in answer.rich_message.html
     assert c.reports.active_draft(7) is None
     c.reports.sheets.apply.assert_not_awaited()
 
@@ -949,7 +973,8 @@ async def test_query_does_not_cancel_or_change_previous_days_draft(conversation)
         action="query", edits=[], additions="", question="", query=TableQuery(metrics=["remaining"])
     )
     await c.send("Сколько осталось кабеля?")
-    assert len(c.session.sent) == 1 and "100 м" in c.session.sent[0].text
+    assert len(c.session.rich) == 1 and "100 м" in c.session.rich[0].rich_message.html
+    assert not c.session.sent
     assert c.reports.store.get_draft(draft.id, 7) == draft
     c.reports.sheets.apply.assert_not_awaited()
 

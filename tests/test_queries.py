@@ -1,7 +1,6 @@
-import csv
 from datetime import date
 from decimal import Decimal
-from io import StringIO
+from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -10,10 +9,39 @@ import pytest
 from m100_bot.config import Settings
 from m100_bot.domain import Line, Position, UserError
 from m100_bot.llm import VoiceCommand
-from m100_bot.queries import TableQuery, csv_bytes
+from m100_bot.queries import TableQuery
 from m100_bot.service import Reports
 from m100_bot.sheets import Snapshot
 from m100_bot.store import Store
+
+
+class TableReader(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self.cell = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self.rows.append([])
+        elif tag in {"td", "th"}:
+            self.cell = []
+
+    def handle_endtag(self, tag):
+        if tag in {"td", "th"}:
+            self.rows[-1].append("".join(self.cell))
+            self.cell = None
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+
+def table_rows(answer):
+    assert answer.rich
+    reader = TableReader()
+    reader.feed(answer.text)
+    return reader.rows
 
 
 @pytest.fixture
@@ -107,7 +135,7 @@ async def test_query_reads_current_values_without_saving_or_using_draft_numbers(
         7, 7, command(ids=["a"], scope="positions", metrics=["completed", "remaining"])
     )
     assert "20 м" in result.text and "80 м" in result.text and "999" not in result.text
-    assert "&lt;3х2,5&gt;" in result.text and result.document is None
+    assert "&lt;3х2,5&gt;" in result.text and result.rich
     assert q.reports.active_draft(7) == draft
     q.sheets.apply.assert_not_awaited()
     q.reports.bitrix.apply.assert_not_awaited()
@@ -159,6 +187,36 @@ async def test_period_quantities_and_pay_are_computed_from_real_period_values(qu
     q.sheets.period_values.assert_awaited_once_with(
         date(2026, 11, 6), date(2026, 11, 6), q.snapshot
     )
+
+
+async def test_monthly_list_is_table_with_period_and_names_shown_once(query_system):
+    q = query_system
+    q.sheets.period_values.return_value = (
+        {"a": Decimal(56), "b": Decimal(35), "c": Decimal(16)},
+        [date(2026, 11, day) for day in (1, 2, 6, 7, 8)],
+    )
+    result = await q.reports.read_query(
+        7,
+        7,
+        command(
+            metrics=["name", "daily"],
+            date_from="2026-11-01",
+            date_to="2026-11-30",
+            sort_by="daily",
+        ),
+    )
+    assert table_rows(result) == [
+        ["ID", "Название", "За период"],
+        ["a", "Кабель <3х2,5>", "56 м"],
+        ["b", "Кабель 3х1,5", "35 м"],
+        ["c", "Блок", "16 шт"],
+    ]
+    assert "01.11.2026–30.11.2026" in result.text
+    assert "Данные есть за 5 дней периода" in result.text
+    assert result.selection["position_ids"] == ["a", "b", "c"]
+    assert result.selection["date_from"] == "2026-11-01"
+    assert result.selection["date_to"] == "2026-11-30"
+    q.sheets.apply.assert_not_awaited()
 
 
 async def test_absent_date_is_distinct_from_zero_volume(query_system):
@@ -228,14 +286,17 @@ async def test_query_selection_survives_restart_and_is_scoped_to_chat_and_table(
 
 async def test_raw_cells_preserve_zero_blank_and_escaped_text(query_system):
     result = await query_system.reports.read_query(7, 7, command(scope="cells", cells=["B5:E5"]))
-    assert (
-        "&lt;Название&gt;" in result.text
-        and "<b>D5</b>: 0" in result.text
-        and "<b>E5</b>: пусто" in result.text
-    )
+    assert table_rows(result) == [
+        ["Ячейка", "Значение"],
+        ["B5", "<Название>"],
+        ["C5", "м"],
+        ["D5", "0"],
+        ["E5", "пусто"],
+    ]
+    assert "&lt;Название&gt;" in result.text
 
 
-async def test_large_query_returns_one_csv_with_all_results(query_system):
+async def test_large_query_keeps_all_results_in_native_table(query_system):
     q = query_system
     for i in range(20):
         p = q.snapshot.positions["a"].model_copy(
@@ -243,10 +304,11 @@ async def test_large_query_returns_one_csv_with_all_results(query_system):
         )
         q.snapshot.positions[p.id] = p
     result = await q.reports.read_query(7, 7, command(metrics=["completed"]))
-    assert result.document is not None and len(result.text) < 1024
-    rows = list(csv.reader(StringIO(result.document.decode("utf-8-sig")), delimiter=";"))
+    rows = table_rows(result)
     assert len(rows) == 24 and rows[-1][0] == "x19"
-    assert "в файле" in result.text
+    assert rows[0] == ["ID", "Название", "Выполнено всего"]
+    assert rows[-1] == ["x19", "Работа 19", "20 м"]
+    assert "в файле" not in result.text
 
 
 @pytest.mark.parametrize(
@@ -265,10 +327,19 @@ async def test_invalid_periods_cannot_read_or_write_other_data(query_system, dat
     q.sheets.apply.assert_not_awaited()
 
 
-def test_csv_formula_content_is_neutralized_without_changing_negative_numbers():
-    text = csv_bytes([["=HYPERLINK(1)", "@formula", "-10", "-test", "normal"]]).decode("utf-8-sig")
-    row = next(csv.reader(StringIO(text), delimiter=";"))
-    assert row == ["'=HYPERLINK(1)", "'@formula", "-10", "'-test", "normal"]
+async def test_long_names_and_html_like_values_are_preserved_once(query_system):
+    q = query_system
+    name = "Кабель <3×2,5> & медный " * 20
+    q.snapshot.positions["a"].name = name
+    result = await q.reports.read_query(
+        7, 7, command(ids=["a"], metrics=["id", "name", "unit", "remaining", "name"])
+    )
+    assert table_rows(result) == [
+        ["ID", "Название", "Единица", "Осталось"],
+        ["a", name, "м", "80 м"],
+    ]
+    assert result.text.count("&lt;3×2,5&gt;") == 20
+    q.sheets.apply.assert_not_awaited()
 
 
 async def test_nested_query_selector_is_used_instead_of_the_whole_catalog(query_system):
@@ -306,8 +377,10 @@ async def test_text_fields_and_numeric_fields_can_be_returned_together(query_sys
     result = await query_system.reports.read_query(
         7, 7, command(ids=["a"], metrics=["name", "unit", "section", "remaining"])
     )
-    assert "&lt;3х2,5&gt;" in result.text and "Единица: м" in result.text
-    assert "Раздел: ЭМ3" in result.text and "80 м" in result.text
+    assert table_rows(result) == [
+        ["ID", "Название", "Единица", "Раздел", "Осталось"],
+        ["a", "Кабель <3х2,5>", "м", "ЭМ3", "80 м"],
+    ]
     assert result.selection["cells"] == ["B5", "C5", "G5"]
 
 

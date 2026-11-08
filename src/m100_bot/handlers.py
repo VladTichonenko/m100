@@ -6,9 +6,9 @@ from io import BytesIO
 from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
+    InputRichMessage,
     LinkPreviewOptions,
     Message,
 )
@@ -179,6 +179,15 @@ def build_router(reports: Reports) -> Router:
                 reports.store.remember(user_id, chat_id, "assistant", content)
                 return result
 
+            async def answer_rich(self, content: InputRichMessage, **kwargs):
+                if self.work_links:
+                    kwargs["reply_markup"] = work_keyboard(
+                        reports, user_id, markup=kwargs.get("reply_markup")
+                    )
+                result = await message.answer_rich(content, **kwargs)
+                reports.store.remember(user_id, chat_id, "assistant", content.html)
+                return result
+
         reply = Reply()
         target = None
         try:
@@ -204,13 +213,11 @@ def build_router(reports: Reports) -> Router:
                         [[InlineKeyboardButton(text="Открыть источник", url=answer.url)]]
                     ),
                 )
-                if answer.document:
-                    await message.answer_document(
-                        BufferedInputFile(answer.document, filename=answer.filename),
-                        caption=answer.text,
+                if answer.rich:
+                    await reply.answer_rich(
+                        InputRichMessage(html=answer.text),
                         reply_markup=markup,
                     )
-                    reports.store.remember(user_id, chat_id, "assistant", answer.text)
                 else:
                     await reply.answer(
                         answer.text,

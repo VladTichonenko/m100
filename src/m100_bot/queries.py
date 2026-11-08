@@ -1,12 +1,10 @@
 """Read-only table queries. The model chooses a plan; Python reads and computes answers."""
 
-import csv
 import re
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from html import escape
-from io import StringIO
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -59,8 +57,7 @@ class QueryAnswer:
     text: str
     url: str
     selection: dict
-    document: bytes | None = None
-    filename: str = "table-query.csv"
+    rich: bool = False
 
 
 LABELS = {
@@ -112,27 +109,20 @@ def display(value: Decimal | str | None, metric: str, unit: str) -> str:
     if value is None:
         return "нет данных"
     if isinstance(value, str):
-        return escape(value)
+        return value
     if metric == "progress":
         return f"{fmt(value.quantize(Decimal('0.1')))} %"
     suffix = "ден. ед." if metric in MONEY else f"ден. ед./{unit}" if metric == "unit_pay" else unit
-    return f"{fmt(value)} {escape(suffix)}"
+    return f"{fmt(value)} {suffix}"
 
 
-def csv_bytes(rows: list[list]) -> bytes:
-    stream = StringIO()
-    writer = csv.writer(stream, delimiter=";")
-    for row in rows:
-        safe = []
-        for value in row:
-            text = str(value)
-            if text.startswith(("=", "+", "-", "@", "\t", "\r")) and not re.fullmatch(
-                r"-?\d+(?:[.,]\d+)?", text
-            ):
-                text = "'" + text
-            safe.append(text)
-        writer.writerow(safe)
-    return stream.getvalue().encode("utf-8-sig")
+def table_html(prefix: str, headers: list[str], rows: list[list[str]]) -> str:
+    """Render a native Telegram Rich Message table; prefix is already escaped HTML."""
+    heading = "".join(f"<th>{escape(header)}</th>" for header in headers)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{escape(value)}</td>" for value in row) + "</tr>" for row in rows
+    )
+    return f"<p>{prefix}</p><table bordered striped compact><tr>{heading}</tr>{body}</table>"
 
 
 def selected_positions(
@@ -223,18 +213,11 @@ async def answer_query(
     url = f"{sheets.url}#gid={snap.sheet_id}"
     if spec.scope == "cells":
         values = await sheets.read_cells(cells, snap)
-        lines = [
-            f"<b>{address}</b>: {escape(value[:160]) if value else 'пусто'}"
-            for address, value in values
-        ]
-        text = prefix + "\n" + "\n".join(lines[:12])
-        document = (
-            csv_bytes([["Ячейка", "Значение"], *values])
-            if len(values) > 12 or any(len(v) > 160 for _, v in values)
-            else None
+        text = table_html(
+            prefix,
+            ["Ячейка", "Значение"],
+            [[address, value or "пусто"] for address, value in values],
         )
-        if document:
-            text = prefix + f" Ячеек: {len(values)}. Все значения — в файле."
         cell_rows = {int(re.search(r"\d+$", cell).group()) for cell, _ in values}
         selected = {
             "kind": "query",
@@ -244,7 +227,7 @@ async def answer_query(
             "date_from": start.isoformat(),
             "date_to": end.isoformat(),
         }
-        return QueryAnswer(text, url, selected, document)
+        return QueryAnswer(text, url, selected, rich=True)
     positions = selected_positions(spec, ids, snap, selection, operations, start, end)
     needs_daily = (
         any(m in {"daily", "day_pay"} for m in metrics)
@@ -340,31 +323,16 @@ async def answer_query(
         return QueryAnswer(
             prefix + f" Позиций: {len(positions)}.\n" + "\n".join(lines), url, selected
         )
-    rows = [["ID", "Работа", "Ед.", *[LABELS[m] for m in metrics]]]
-    lines = []
+    table_metrics = ["id", "name", *[m for m in metrics if m not in {"id", "name"}]]
+    rows = []
     for p in positions:
-        values = [metric_value(p, metric, daily) for metric in metrics]
         rows.append(
             [
-                p.id,
-                p.name,
-                p.unit,
-                *[
-                    (fmt(v).replace(".", ",") if isinstance(v, Decimal) else v)
-                    if v is not None
-                    else "нет данных"
-                    for v in values
-                ],
+                display(metric_value(p, metric, daily), metric, p.unit)
+                for metric in table_metrics
             ]
         )
-        detail = "; ".join(
-            f"{LABELS[m]}: {display(v, m, p.unit)}" for m, v in zip(metrics, values, strict=True)
-        )
-        lines.append(f"<b>{escape(p.id)} · {escape(p.name[:140])}</b>\n{detail}")
-    text = prefix + "\n\n" + "\n\n".join(lines)
-    if len(text) > 3400 or len(positions) > 12:
-        caption = prefix + f" Найдено позиций: {len(positions)}. Все значения — в файле."
-        return QueryAnswer(caption, url, selected, csv_bytes(rows))
+    text = table_html(prefix, [LABELS[m] for m in table_metrics], rows)
     if selected_cells:
         url += "&range=" + selected_cells[0]
-    return QueryAnswer(text, url, selected)
+    return QueryAnswer(text, url, selected, rich=True)
