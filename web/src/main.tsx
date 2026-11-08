@@ -433,7 +433,7 @@ function App() {
     </header>
     <div className={`workspace-layout ${report ? 'with-dashboard' : ''}`}><section className="work-column" aria-label="Текущий отчёт">
     {report && <div className="desktop-work-heading"><div><span>ТЕКУЩИЙ ОТЧЁТ</span><h2>{saved ? 'Работы сохранены' : retrying ? 'Завершаем сохранение' : 'Ваши работы'}</h2><p>{saved ? 'Результат уже в таблице. Можно продолжить в чате.' : retrying ? report?.operation?.sheets_done ? 'Объёмы уже в Google Sheets. Повторите отправку в Битрикс24.' : 'Запись не завершена. Повторите сохранение.' : 'Проверьте объёмы — и можно сохранять.'}</p></div><span className="desktop-work-count">{String(visible.length).padStart(2, '0')}</span></div>}
-    <main className={`cards-page ${report ? 'has-report-actions' : ''} ${report && (report.operation || error) ? 'has-save-status' : ''}`} aria-label="Карточки работ">
+    <main className={`cards-page ${report ? 'has-report-actions' : ''} ${saved ? 'has-saved-actions' : ''} ${report && error ? 'has-save-status' : ''}`} aria-label="Карточки работ">
       {loading ? <article className="state-card" role="status"><LoaderCircle className="spin" size={22} />Загружаем…</article>
         : !report ? <article className="state-card empty-report" aria-labelledby="empty-report-title">
             <img className="empty-report-art" src="/assets/empty-report-voice.png" width="192" height="192" alt="" />
@@ -492,7 +492,6 @@ function App() {
     </main>
 
     {report && <footer className="page-actions report-actions" aria-label="Сохранение отчёта"><div className="report-actions-inner">
-      {report.operation && <div className="sync-status" role="status" aria-live="polite"><span className={report.operation.sheets_done ? 'sync-done' : ''}>Google Sheets: {report.operation.sheets_done ? 'сохранено' : 'ожидает записи'}</span><span className={report.operation.bitrix_done && !report.operation.bitrix_skipped ? 'sync-done' : ''}>Битрикс24: {!report.bitrix_enabled || report.operation.bitrix_skipped ? 'отключён' : report.operation.bitrix_done ? 'сохранено' : 'ожидает повторной отправки'}</span></div>}
       {error && selected == null && <p className="page-error" role="alert">{error}</p>}
       {!saved && !cancelled && <><button className="button button-dark report-save" disabled={busy || (!retrying && (!visible.length && report.draft.mode !== 'replace'))} onClick={() => void confirmReport()}>{busy ? <LoaderCircle className="spin" size={18} /> : <Save size={18} />}{retrying ? 'Повторить сохранение' : 'Сохранить отчёт'}</button><button className="button button-white report-overwrite" title="Перезаписать голосом или рассказать, что исправить" aria-label="Перезаписать голосом" disabled={locked} onClick={overwriteDraft}><RotateCcw size={20} /><span className="mobile-overwrite-label">Перезаписать</span></button></>}
       {saved && <><span className="save-success"><CircleCheck size={20} />Сохранено в таблицу</span><button className="button button-white edit-today-action" disabled={busy} onClick={editToday}>{busy ? <LoaderCircle className="spin" size={18} /> : <PencilLine size={18} />}Исправить за сегодня</button></>}
