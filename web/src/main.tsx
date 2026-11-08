@@ -555,7 +555,7 @@ function App() {
       <div className="delete-dialog-actions"><button className="button button-soft" autoFocus disabled={busy} onClick={closeDelete}>Отмена</button><button className="button button-danger" disabled={locked} onClick={deleteCard}>{busy ? <LoaderCircle className="spin" size={17} /> : <Trash2 size={17} />}Удалить</button></div>
     </dialog>
 
-    {toast && <div className="toast" role="status"><CircleCheck size={17} /><span>{toast}</span>{deleted && !locked && <button onClick={undoDeleted}><RotateCcw size={14} />Вернуть</button>}<button className="toast-close" aria-label="Закрыть уведомление" onClick={() => setToast('')}><X size={15} /></button></div>}
+    {toast && <div className="toast" role="status" aria-atomic="true"><CircleCheck size={17} aria-hidden="true" /><span>{toast}</span>{deleted && !locked && <button className="toast-undo" onClick={undoDeleted}><RotateCcw size={14} />Вернуть</button>}<button className="toast-close" aria-label="Закрыть уведомление" onClick={() => setToast('')}><X size={15} /></button></div>}
   </>;
 }
 
