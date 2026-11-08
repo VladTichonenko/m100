@@ -19,7 +19,7 @@ from .bot_pages import BotPages
 from .domain import UserError, number, validate_line
 from .navigation import NAVIGATION_ACTIONS, help_page, spoken_navigation
 from .service import Reports
-from .ui import button, keyboard, show_draft, show_saved, table_button
+from .ui import button, keyboard, show_draft, show_saved, table_button, work_keyboard
 from .voice import Voice
 
 logger = logging.getLogger(__name__)
@@ -43,8 +43,10 @@ class AccessAndErrors(BaseMiddleware):
                     "Откройте личный чат с ботом."
                 )
             return
+        authorized = False
         try:
             principal = await self.reports.require_access(user.id)
+            authorized = True
             if isinstance(event, CallbackQuery) and (event.data or "").startswith("d:"):
                 await self.reports.require_access(user.id, write=True)
             elif (
@@ -65,13 +67,17 @@ class AccessAndErrors(BaseMiddleware):
                 )
                 return await handler(event, data)
         except UserError as exc:
-            await message.answer(escape(str(exc)) + f"\nВаш Telegram ID: <code>{user.id}</code>.")
+            await message.answer(
+                escape(str(exc)) + f"\nВаш Telegram ID: <code>{user.id}</code>.",
+                reply_markup=work_keyboard(self.reports, user.id) if authorized else None,
+            )
         except Exception as exc:
             # HTTP exception strings can contain a Bitrix webhook or Telegram token.
             logger.error("Handler failed: %s", type(exc).__name__)
             await message.answer(
                 "Не удалось завершить действие. Черновик сохранён. "
-                "Откройте /draft и повторите действие."
+                "Откройте /draft и повторите действие.",
+                reply_markup=work_keyboard(self.reports, user.id) if authorized else None,
             )
 
 
@@ -107,7 +113,9 @@ def build_router(reports: Reports) -> Router:
 
     @router.message(Command("remaining"))
     async def remaining(message: Message):
-        await pages.remaining(message, (message.text or "").partition(" ")[2])
+        await pages.remaining(
+            message, message.from_user.id, (message.text or "").partition(" ")[2]
+        )
 
     @router.callback_query(F.data.startswith("help:"))
     async def help_section(query: CallbackQuery):
@@ -129,6 +137,8 @@ def build_router(reports: Reports) -> Router:
             await pages.drafts(query.message, query.from_user.id, offset)
         elif action == "restart":
             await pages.welcome(query.message, query.from_user.id)
+        elif action == "report":
+            await pages.report(query.message, query.from_user.id)
 
     async def offer_positions(message: Message, draft, index: int, keys: list[str]):
         snap = await reports.sheets.snapshot(draft.day)
@@ -150,7 +160,7 @@ def build_router(reports: Reports) -> Router:
         rows.append([button(draft, "Назад к отчёту", "back")])
         await message.answer(
             text if keys else "Ничего не найдено. Попробуйте другое название.",
-            reply_markup=keyboard(rows),
+            reply_markup=work_keyboard(reports, draft.user_id, draft=draft, markup=keyboard(rows)),
         )
 
     async def process_command(message: Message, text: str, *, voice: bool = False):
@@ -158,7 +168,13 @@ def build_router(reports: Reports) -> Router:
         reports.store.remember(user_id, chat_id, "user", text)
 
         class Reply:
+            work_links = False
+
             async def answer(self, content, **kwargs):
+                if self.work_links:
+                    kwargs["reply_markup"] = work_keyboard(
+                        reports, user_id, markup=kwargs.get("reply_markup")
+                    )
                 result = await message.answer(content, **kwargs)
                 reports.store.remember(user_id, chat_id, "assistant", content)
                 return result
@@ -170,16 +186,24 @@ def build_router(reports: Reports) -> Router:
             if navigation:
                 await pages.navigate(reply, user_id, chat_id, navigation.action, navigation.section)
                 return
+            reply.work_links = True
             snapshot = await reports.sheets.snapshot(reports.today())
             command, target = await reports.plan_command(user_id, chat_id, text, snapshot=snapshot)
             if command.action in NAVIGATION_ACTIONS:
+                reply.work_links = False
                 await pages.navigate(reply, user_id, chat_id, command.action, command.help_section)
                 return
             if command.action not in {"query", "table"}:
                 await reports.require_access(user_id, write=True)
             if command.action == "query":
                 answer = await reports.read_query(user_id, chat_id, command, snapshot=snapshot)
-                markup = keyboard([[InlineKeyboardButton(text="Открыть источник", url=answer.url)]])
+                markup = work_keyboard(
+                    reports,
+                    user_id,
+                    markup=keyboard(
+                        [[InlineKeyboardButton(text="Открыть источник", url=answer.url)]]
+                    ),
+                )
                 if answer.document:
                     await message.answer_document(
                         BufferedInputFile(answer.document, filename=answer.filename),
@@ -269,6 +293,13 @@ def build_router(reports: Reports) -> Router:
                 "Эта кнопка устарела. Используйте кнопки последнего черновика или /draft."
             )
         message = query.message
+
+        async def answer(content, **kwargs):
+            kwargs["reply_markup"] = work_keyboard(
+                reports, draft.user_id, draft=draft, markup=kwargs.get("reply_markup")
+            )
+            return await message.answer(content, **kwargs)
+
         if action == "ok":
             try:
                 op = await reports.confirm(draft)
@@ -282,7 +313,7 @@ def build_router(reports: Reports) -> Router:
                     detail += "\nБитрикс24: " + (
                         "сохранено" if op.bitrix_done else "ожидает сохранения"
                     )
-                await message.answer(
+                await answer(
                     escape(str(exc)) + detail,
                     reply_markup=keyboard([[button(draft, "Повторить сохранение", "ok")]]),
                 )
@@ -291,13 +322,13 @@ def build_router(reports: Reports) -> Router:
             return
         if action == "cancel":
             reports.cancel(draft)
-            await message.answer("Черновик отменён. Данные не записывались.")
+            await answer("Черновик отменён. Данные не записывались.")
             return
         reports.editable(draft)
         if action == "add":
             draft.action = "add"
             reports.save_edit(draft)
-            await message.answer("Напишите, какую работу добавить и сколько выполнено.")
+            await answer("Напишите, какую работу добавить и сколько выполнено.")
             return
         if action == "pick":
             rows = [
@@ -305,7 +336,7 @@ def build_router(reports: Reports) -> Router:
                 for i, line in enumerate(draft.lines)
             ]
             rows.append([button(draft, "Назад", "back")])
-            await message.answer("Выберите строку для изменения:", reply_markup=keyboard(rows))
+            await answer("Выберите строку для изменения:", reply_markup=keyboard(rows))
             return
         if action == "back":
             draft.action = ""
@@ -321,7 +352,7 @@ def build_router(reports: Reports) -> Router:
         line = draft.lines[index]
         if action == "line":
             remove = "Обнулить / удалить" if draft.mode == "replace" else "Удалить"
-            await message.answer(
+            await answer(
                 f"Строка {index + 1}: {escape(line.phrase)}",
                 reply_markup=keyboard(
                     [
@@ -338,7 +369,7 @@ def build_router(reports: Reports) -> Router:
             draft.action_index = index
             reports.save_edit(draft)
             if action == "qty":
-                await message.answer(
+                await answer(
                     "Введите количество числом, например 15 или 2,5. "
                     "Для обнуления сегодняшней позиции введите 0."
                 )
@@ -346,7 +377,7 @@ def build_router(reports: Reports) -> Router:
                 if line.candidates:
                     await offer_positions(message, draft, index, line.candidates)
                 else:
-                    await message.answer("Напишите часть названия или ID позиции из таблицы.")
+                    await answer("Напишите часть названия или ID позиции из таблицы.")
         elif action == "choose":
             snap = await reports.sheets.snapshot(draft.day)
             if not extra or extra[0] not in snap.positions:
@@ -443,21 +474,34 @@ def build_router(reports: Reports) -> Router:
                 await message.bot.download(voice, destination=buffer)
                 text = await Voice(reports.settings, reports.llm.http).transcribe(buffer.getvalue())
             except UserError as exc:
-                await status.edit_text(str(exc), parse_mode=None)
+                await status.edit_text(
+                    str(exc),
+                    parse_mode=None,
+                    reply_markup=work_keyboard(reports, message.from_user.id),
+                )
                 return
             except Exception as exc:
                 logger.error("Voice transcription failed: %s", type(exc).__name__)
                 await status.edit_text(
                     "Не удалось обработать голосовое. Попробуйте ещё раз или отправьте текст.",
                     parse_mode=None,
+                    reply_markup=work_keyboard(reports, message.from_user.id),
                 )
                 return
             # Even emoji occupy at most two UTF-16 units: leave room for the heading
             # within Telegram's 4096-character limit and keep the entire transcript.
             parts = [text[i : i + 2000] for i in range(0, len(text), 2000)]
-            await status.edit_text(f"🎙 Расшифровка:\n\n{parts[0]}", parse_mode=None)
+            await status.edit_text(
+                f"🎙 Расшифровка:\n\n<blockquote>{escape(parts[0])}</blockquote>",
+                parse_mode="HTML",
+                reply_markup=work_keyboard(reports, message.from_user.id),
+            )
             for part in parts[1:]:
-                await message.answer(part, parse_mode=None)
+                await message.answer(
+                    f"<blockquote>{escape(part)}</blockquote>",
+                    parse_mode="HTML",
+                    reply_markup=work_keyboard(reports, message.from_user.id),
+                )
             await process_command(message, text, voice=True)
 
     @router.message()

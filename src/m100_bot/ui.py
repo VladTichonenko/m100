@@ -35,6 +35,35 @@ def report_button(draft: Draft, reports: Reports) -> InlineKeyboardButton:
     return InlineKeyboardButton(text="Открыть отчёт", url=url)
 
 
+def work_keyboard(
+    reports: Reports,
+    user_id: int | None,
+    *,
+    draft: Draft | None = None,
+    markup: InlineKeyboardMarkup | None = None,
+) -> InlineKeyboardMarkup:
+    """Keep report and table access on work replies without losing action buttons."""
+    rows = [list(row) for row in markup.inline_keyboard] if markup else []
+    labels = {item.text for row in rows for item in row}
+    if "Открыть отчёт" not in labels:
+        if draft is None and user_id is not None:
+            draft = reports.store.active_draft(user_id) or reports.store.latest_saved_report(
+                user_id, reports.today()
+            )
+        if draft and reports.settings.web_enabled:
+            opener = report_button(draft, reports)
+        elif draft:
+            opener = InlineKeyboardButton(
+                text="Открыть отчёт", callback_data=f"nav:draft:{draft.id}"
+            )
+        else:
+            opener = InlineKeyboardButton(text="Открыть отчёт", callback_data="nav:report")
+        rows.append([opener])
+    if "Открыть таблицу" not in labels:
+        rows.append([table_button(reports)])
+    return keyboard(rows)
+
+
 def issue_text(draft: Draft, limit: int = 2) -> str:
     issues = [
         line
@@ -72,6 +101,12 @@ def color_text(color: str | None) -> str:
 
 
 async def show_saved(message, op: Operation, reports: Reports) -> None:
+    owner = op.user_id if op.user_id is not None else reports.store.draft_owner(op.draft_id)
+    draft = (
+        reports.store.get_draft(op.draft_id, owner)
+        if owner is not None and op.kind == "report"
+        else None
+    )
     if op.kind == "format":
         text = (
             f"Снял заливку с {len(op.cells)} ячеек."
@@ -102,19 +137,13 @@ async def show_saved(message, op: Operation, reports: Reports) -> None:
             )
         ]
     ]
-    if op.continuation_id:
-        owner = op.user_id
-        if owner is None:
-            owner = reports.store.draft_owner(op.draft_id)
-        if owner is not None:
-            remaining = reports.store.get_draft(op.continuation_id, owner)
-            text += "\n\nОстальное оставил в черновике.\n" + issue_text(remaining)
-            if reports.settings.web_enabled:
-                rows.append([report_button(remaining, reports)])
-            else:
-                rows.append([button(remaining, "Открыть черновик", "back")])
+    if op.continuation_id and owner is not None:
+        draft = reports.store.get_draft(op.continuation_id, owner)
+        text += "\n\nОстальное оставил в черновике.\n" + issue_text(draft)
     await message.answer(
-        text, reply_markup=keyboard(rows), link_preview_options=LinkPreviewOptions(is_disabled=True)
+        text,
+        reply_markup=work_keyboard(reports, owner, draft=draft, markup=keyboard(rows)),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
     if op.kind == "report":
         owner = reports.store.draft_owner(op.draft_id)
@@ -179,7 +208,9 @@ async def show_draft(message, draft: Draft, reports: Reports, *, notice: str = "
             [table_button(reports)],
         ]
     await message.answer(
-        text, reply_markup=keyboard(rows), link_preview_options=LinkPreviewOptions(is_disabled=True)
+        text,
+        reply_markup=work_keyboard(reports, draft.user_id, draft=draft, markup=keyboard(rows)),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
     if reports.settings.web_enabled and reports.settings.web_auto_open:
         try:

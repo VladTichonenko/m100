@@ -1,8 +1,10 @@
 """Telegram conversation checks with a fake Bot API, no outgoing messages."""
 
 from datetime import UTC, date, datetime
+from html import escape, unescape
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import urlsplit
 
 import pytest
 from aiogram import Bot, Dispatcher
@@ -17,6 +19,22 @@ from m100_bot.service import Reports
 from m100_bot.sheets import Snapshot
 from m100_bot.store import Store
 from m100_bot.voice import Voice
+
+
+def assert_work_links(message, reports, draft=None):
+    buttons = [b for row in message.reply_markup.inline_keyboard for b in row]
+    labels = [b.text for b in buttons]
+    assert labels.count("Открыть отчёт") == labels.count("Открыть таблицу") == 1
+    assert next(b for b in buttons if b.text == "Открыть таблицу").url == reports.sheets.url
+    opener = next(b for b in buttons if b.text == "Открыть отчёт")
+    if draft and reports.settings.web_enabled:
+        link = urlsplit(opener.url or opener.web_app.url)
+        assert link.path == f"/report/{draft.id}"
+        assert reports.store.from_web_token(draft.id, link.fragment.removeprefix("token=")).id == (
+            draft.id
+        )
+    elif not draft:
+        assert opener.callback_data == "nav:report"
 
 
 class TelegramSession(BaseSession):
@@ -160,7 +178,8 @@ async def test_only_admin_can_open_user_management(conversation, role):
         assert "secret" not in message.text + message.reply_markup.model_dump_json()
     else:
         assert "только администратору" in message.text
-        assert message.reply_markup is None
+        assert_work_links(message, c.reports)
+        assert "secret" not in message.reply_markup.model_dump_json()
 
 
 async def test_voice_edit_shows_transcription_and_remembers_it(conversation, monkeypatch):
@@ -193,7 +212,9 @@ async def test_voice_edit_shows_transcription_and_remembers_it(conversation, mon
     monkeypatch.setattr(c.bot, "download", download)
 
     async def plan(*args, **kwargs):
-        assert c.session.edited[0].text == f"🎙 Расшифровка:\n\n{text}"
+        assert c.session.edited[0].text == (
+            f"🎙 Расшифровка:\n\n<blockquote>{escape(text)}</blockquote>"
+        )
         return c.llm.command.return_value
 
     c.llm.command.side_effect = plan
@@ -203,7 +224,8 @@ async def test_voice_edit_shows_transcription_and_remembers_it(conversation, mon
     assert "20 м" in messages[1]
     assert len(c.session.edited) == 1
     assert c.session.edited[0].message_id == 1
-    assert c.session.edited[0].parse_mode is None
+    assert c.session.edited[0].parse_mode == "HTML"
+    assert_work_links(c.session.edited[0], c.reports, original)
     assert c.reports.store.history(7, 7)[0]["content"] == text
     assert c.session.sent[-1].reply_markup.inline_keyboard[0][0].text == "Открыть отчёт"
     assert c.reports.store.get_draft(original.id, 7).lines[0].quantity == 20
@@ -220,10 +242,136 @@ async def test_ambiguous_voice_asks_once_without_creating_fake_work(conversation
     await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     assert len(c.session.sent) == 2
     assert c.session.sent[0].text == "Слушаю"
-    assert c.session.edited[0].text == "🎙 Расшифровка:\n\nИсправь это"
+    assert c.session.edited[0].text == "🎙 Расшифровка:\n\n<blockquote>Исправь это</blockquote>"
     assert c.session.sent[1].text == "Какую работу изменить?"
+    assert_work_links(c.session.sent[1], c.reports)
     assert c.reports.store.active_draft(7) is None
     assert c.reports.store.history(7, 7)[0]["content"] == "Исправь это"
+
+
+@pytest.mark.parametrize("spoken", [False, True])
+@pytest.mark.parametrize("saved", [False, True])
+async def test_followup_clarification_links_to_existing_report(
+    conversation, monkeypatch, spoken, saved
+):
+    c = conversation
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    if saved:
+        await c.reports.confirm(draft)
+        draft = c.reports.store.get_draft(draft.id, 7)
+    c.llm.command.return_value = VoiceCommand(
+        action="clarify", edits=[], additions="", question="Уточните модель наружного блока."
+    )
+    text = "Так, ещё раз скажи, что надо уточнить?"
+    if spoken:
+        monkeypatch.setattr(Voice, "transcribe", AsyncMock(return_value=text))
+        monkeypatch.setattr(c.bot, "download", AsyncMock())
+        await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
+    else:
+        await c.send(text)
+    assert "Уточните модель" in c.session.sent[-1].text
+    assert_work_links(c.session.sent[-1], c.reports, draft)
+    assert c.reports.store.get_draft(draft.id, 7) == draft
+
+
+async def test_report_button_without_draft_opens_report_page(conversation):
+    c = conversation
+    c.llm.command.return_value = VoiceCommand(
+        action="clarify", edits=[], additions="", question="Какую работу добавить?"
+    )
+    await c.send("Добавь это")
+    assert_work_links(c.session.sent[-1], c.reports)
+    await c.click("nav:report")
+    assert "За сегодня пока нет отчёта" in c.session.sent[-1].text
+    assert_work_links(c.session.sent[-1], c.reports)
+    assert c.reports.store.active_draft(7) is None
+    c.reports.sheets.apply.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", ["add", "pick", "line", "qty", "position", "candidates"])
+async def test_manual_work_prompts_keep_links_and_action_buttons(conversation, action):
+    c = conversation
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    if action == "candidates":
+        draft.lines[0].candidates = ["cable"]
+        c.reports.save_edit(draft)
+    await c.click(
+        f"d:{draft.id}:{draft.revision}:{'position' if action == 'candidates' else action}:0"
+    )
+    message = c.session.sent[-1]
+    assert_work_links(message, c.reports, draft)
+    callbacks = [b.callback_data for row in message.reply_markup.inline_keyboard for b in row]
+    if action == "pick":
+        assert any(value and ":line:0" in value for value in callbacks)
+    elif action == "line":
+        assert any(value and ":qty:0" in value for value in callbacks)
+    elif action == "candidates":
+        assert any(value and ":choose:0:cable" in value for value in callbacks)
+    c.reports.sheets.apply.assert_not_awaited()
+
+
+async def test_invalid_quantity_reply_keeps_report_links(conversation):
+    c = conversation
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    draft.action = "qty"
+    draft.action_index = 0
+    c.reports.save_edit(draft)
+    await c.send("-1")
+    assert "неотрицательное количество" in c.session.sent[-1].text
+    assert_work_links(c.session.sent[-1], c.reports, draft)
+    c.reports.sheets.apply.assert_not_awaited()
+
+
+async def test_save_failure_keeps_retry_and_work_links(conversation):
+    c = conversation
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    c.reports.sheets.apply.side_effect = UserError("Временная ошибка Google")
+    await c.click(f"d:{draft.id}:{draft.revision}:ok:0")
+    message = c.session.sent[-1]
+    assert "Временная ошибка Google" in message.text
+    assert_work_links(message, c.reports, draft)
+    assert message.reply_markup.inline_keyboard[0][0].text == "Повторить сохранение"
+
+
+async def test_remaining_links_appear_on_every_message(conversation):
+    c = conversation
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    positions = c.reports.sheets.snapshot.return_value.positions
+    source = positions["cable"]
+    for i in range(60):
+        position = source.model_copy(
+            update={"id": f"work{i}", "name": f"Работа {i}: " + "наружный блок " * 6}
+        )
+        positions[position.id] = position
+    await c.send("/remaining")
+    assert len(c.session.sent) > 1
+    for message in c.session.sent:
+        assert_work_links(message, c.reports, draft)
+    c.reports.sheets.apply.assert_not_awaited()
+
+
+async def test_report_link_without_web_editor_opens_saved_report(conversation):
+    c = conversation
+    c.reports.settings.web_enabled = False
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    await c.reports.confirm(draft)
+    saved = c.reports.store.get_draft(draft.id, 7)
+    await c.send("/table")
+    buttons = [b for row in c.session.sent[-1].reply_markup.inline_keyboard for b in row]
+    opener = next(b for b in buttons if b.text == "Открыть отчёт")
+    assert opener.callback_data == f"nav:draft:{draft.id}"
+    await c.click(opener.callback_data)
+    assert "сохранён" in c.session.sent[-1].text
+    assert c.reports.store.get_draft(draft.id, 7) == saved
+
+
+async def test_no_access_does_not_disclose_work_links(conversation):
+    c = conversation
+    await c.reports.create(7, 7, "кабель 10 метров")
+    c.reports.settings.allowed_user_ids = "99"
+    await c.send("/report")
+    assert c.session.sent[-1].reply_markup is None
+    assert "token=" not in c.session.sent[-1].text
 
 
 @pytest.mark.parametrize("failure", ["recognition", "download"])
@@ -257,11 +405,15 @@ async def test_long_voice_transcript_is_shown_in_full(conversation, monkeypatch)
     first = c.session.edited[0]
     transcript = [first, *c.session.sent[1:-1]]
     assert first.message_id == 1
-    assert first.text.removeprefix("🎙 Расшифровка:\n\n") + "".join(
-        m.text for m in transcript[1:]
-    ) == text
-    assert all(len(m.text.encode("utf-16-le")) // 2 <= 4096 for m in transcript)
-    assert all(m.parse_mode is None for m in transcript)
+    decoded = []
+    for m in transcript:
+        quoted = m.text.removeprefix("🎙 Расшифровка:\n\n")
+        assert quoted.startswith("<blockquote>") and quoted.endswith("</blockquote>")
+        decoded.append(unescape(quoted.removeprefix("<blockquote>").removesuffix("</blockquote>")))
+        assert_work_links(m, c.reports)
+    assert "".join(decoded) == text
+    assert all(len(part.encode("utf-16-le")) // 2 + 20 <= 4096 for part in decoded)
+    assert all(m.parse_mode == "HTML" for m in transcript)
     assert c.llm.command.call_args.args[0] == text
 
 
@@ -391,6 +543,7 @@ async def test_save_confirmed_yellow_returns_cells_table_and_remainder(
     assert "жёлтым" in receipt.text
     assert "J5" in receipt.text and "Лист1" in receipt.text
     assert receipt.reply_markup.inline_keyboard[0][0].url.endswith("#gid=0&range=J5")
+    assert_work_links(receipt, c.reports, c.reports.active_draft(7))
     assert any("Уточните диаметр трубы" in m.text for m in c.session.sent)
     c.llm.extract.assert_awaited_once()
 
@@ -435,6 +588,7 @@ async def test_format_today_replies_once_without_reopening_unresolved_report(
     assert "синим" in c.session.sent[-1].text
     assert "наружн" not in c.session.sent[-1].text and "черновик" not in c.session.sent[-1].text
     assert c.reports.active_draft(7) == pending
+    assert_work_links(c.session.sent[-1], c.reports, pending)
     op = c.reports.sheets.apply.call_args.args[0]
     assert op.kind == "format" and op.cells == ["J5"] and not op.changes
 
@@ -563,6 +717,7 @@ async def test_table_question_answers_once_with_values_and_leaves_draft_untouche
     assert len(c.session.sent) == 1 + int(voice) and not c.session.documents
     assert "100 м" in c.session.sent[-1].text
     assert "Открыть источник" == c.session.sent[-1].reply_markup.inline_keyboard[0][0].text
+    assert_work_links(c.session.sent[-1], c.reports, pending)
     assert c.reports.active_draft(7) == pending
     c.reports.sheets.snapshot.assert_awaited_once()
     c.reports.sheets.apply.assert_not_awaited()
@@ -585,6 +740,7 @@ async def test_large_table_query_sends_single_document_instead_of_message_spam(c
     await c.send("Покажи остатки по всем работам")
     assert len(c.session.documents) == 1 and len(c.session.sent) == 0
     document = c.session.documents[0]
+    assert_work_links(document, c.reports)
     assert document.document.filename.endswith(".csv") and b"work19" in document.document.data
     assert len(document.caption) < 1024
     assert c.reports.active_draft(7) is None

@@ -7,7 +7,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aiogram import Bot
-from aiogram.types import ForceReply
 from aiohttp import web
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -16,7 +15,7 @@ from .domain import CardDetails, Draft, Line, UserError, number, validate_line
 from .estimate import estimate_warnings
 from .profiles import public_profile, telegram_profile
 from .service import Reports
-from .ui import keyboard, table_button
+from .ui import work_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -205,10 +204,7 @@ def create_app(
                 "Или расскажите, что отредактировать: «Исправь кабель на 20 метров».\n\n"
                 "Текущий черновик сохранён до получения новой команды.",
                 parse_mode="HTML",
-                reply_markup=ForceReply(
-                    selective=True,
-                    input_field_placeholder="Запишите голосовое или опишите правки",
-                ),
+                reply_markup=work_keyboard(reports, draft.user_id, draft=draft),
             )
             draft.action = "voice"
             reports.save_edit(draft)
@@ -315,7 +311,7 @@ def create_app(
                         "Работы и объёмы записаны в исходную таблицу.\n"
                         "Если нужно исправить результат, отправьте голосовую команду.",
                         parse_mode="HTML",
-                        reply_markup=keyboard([[table_button(reports)]]),
+                        reply_markup=work_keyboard(reports, current.user_id, draft=current),
                     )
                 except Exception as exc:
                     # A notification failure must not turn a completed write into a failed save.

@@ -9,7 +9,7 @@ from .access import ROLE_NAMES
 from .domain import UserError, fmt
 from .navigation import help_page, main_keyboard
 from .service import Reports
-from .ui import keyboard, report_button, show_draft, table_button
+from .ui import keyboard, report_button, show_draft, table_button, work_keyboard
 
 
 class BotPages:
@@ -85,7 +85,10 @@ class BotPages:
         if pager:
             rows.append(pager)
         rows.append([InlineKeyboardButton(text="⌂ Главное меню", callback_data="nav:restart")])
-        await message.answer("🗂 <b>Мои черновики</b>\n\n" + text, reply_markup=keyboard(rows))
+        await message.answer(
+            "🗂 <b>Мои черновики</b>\n\n" + text,
+            reply_markup=work_keyboard(self.reports, user_id, markup=keyboard(rows)),
+        )
 
     async def report(self, message, user_id: int):
         reports = self.reports
@@ -96,8 +99,12 @@ class BotPages:
             await message.answer(
                 "📋 <b>Ваш отчёт</b>\n\nЗа сегодня пока нет отчёта. Расскажите, что сделали:\n"
                 "<blockquote>Проложили кабель три на два с половиной — 15 метров.</blockquote>",
-                reply_markup=keyboard(
-                    [[InlineKeyboardButton(text="🎙 Примеры команд", callback_data="help:work")]]
+                reply_markup=work_keyboard(
+                    reports,
+                    user_id,
+                    markup=keyboard(
+                        [[InlineKeyboardButton(text="🎙 Примеры команд", callback_data="help:work")]]
+                    ),
                 ),
             )
         elif draft.status == "done":
@@ -125,7 +132,7 @@ class BotPages:
             reply_markup=keyboard([[InlineKeyboardButton(text="Пользователи бота", url=url)]]),
         )
 
-    async def remaining(self, message, query: str = ""):
+    async def remaining(self, message, user_id: int, query: str = ""):
         reports = self.reports
         snap = await reports.sheets.snapshot(reports.today())
         query = query.lower().strip()
@@ -142,10 +149,10 @@ class BotPages:
                 f"\n{escape(p.id)} · {escape(p.name)}\n<b>{fmt(p.remaining)} {escape(p.unit)}</b>\n"
             )
             if len(text) + len(line) > 3500:
-                await message.answer(text)
+                await message.answer(text, reply_markup=work_keyboard(reports, user_id))
                 text = ""
             text += line
-        await message.answer(text, reply_markup=keyboard([[table_button(reports)]]))
+        await message.answer(text, reply_markup=work_keyboard(reports, user_id))
 
     async def navigate(self, message, user_id: int, chat_id: int, action: str, section="overview"):
         reports = self.reports
@@ -160,7 +167,7 @@ class BotPages:
         elif action == "table":
             await message.answer(
                 "📊 <b>Рабочая таблица М100</b>\nСпецификация, объёмы и результат вашей работы.",
-                reply_markup=keyboard([[table_button(reports)]]),
+                reply_markup=work_keyboard(reports, user_id),
             )
         elif action == "today":
             await reports.require_access(user_id, write=True)
@@ -170,13 +177,17 @@ class BotPages:
             await reports.require_access(user_id, write=True)
             draft = reports.active_draft(user_id)
             if not draft:
-                await message.answer("🗂 Незавершённого черновика нет.")
+                await message.answer(
+                    "🗂 Незавершённого черновика нет.",
+                    reply_markup=work_keyboard(reports, user_id),
+                )
             else:
                 reports.cancel(draft)
                 await message.answer(
-                    "Черновик отменён. Данные не записывались.", reply_markup=main_keyboard()
+                    "Черновик отменён. Данные не записывались.",
+                    reply_markup=work_keyboard(reports, user_id, draft=draft),
                 )
         elif action == "remaining":
-            await self.remaining(message)
+            await self.remaining(message, user_id)
         elif action == "users":
             await self.registry(message, user_id)

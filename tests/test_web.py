@@ -301,6 +301,14 @@ async def test_rewrite_invites_voice_once_without_writing_or_deleting_draft(edit
         assert data["draft"]["lines"] == [line.model_dump(mode="json") for line in e.draft.lines]
     e.bot.send_message.assert_awaited_once()
     assert "Давайте перезапишем" in e.bot.send_message.call_args.args[1]
+    buttons = [
+        b
+        for row in e.bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard
+        for b in row
+    ]
+    assert [b.text for b in buttons] == ["Открыть отчёт", "Открыть таблицу"]
+    assert f"/report/{e.draft.id}#token=" in buttons[0].url
+    assert buttons[1].url == e.reports.sheets.url
     e.reports.sheets.apply.assert_not_awaited()
     assert e.reports.store.active_draft(7).action == "voice"
 
@@ -339,6 +347,14 @@ async def test_web_save_notifies_single_owner_once_even_after_retry(editor):
     e.bot.send_message.assert_awaited_once()
     assert e.bot.send_message.call_args.args[0] == 7
     assert "сохранён" in e.bot.send_message.call_args.args[1]
+    buttons = [
+        b
+        for row in e.bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard
+        for b in row
+    ]
+    assert [b.text for b in buttons] == ["Открыть отчёт", "Открыть таблицу"]
+    assert f"/report/{e.draft.id}#token=" in buttons[0].url
+    assert buttons[1].url == e.reports.sheets.url
     e.reports.sheets.apply.assert_awaited_once()
 
 
