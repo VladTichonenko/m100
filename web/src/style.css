@@ -478,8 +478,8 @@ p { margin: 0; }
 @keyframes drawer-backdrop-in { from { background: #24334e00; backdrop-filter: blur(0); } to { background: #24334e66; backdrop-filter: blur(5px); } }
 @keyframes drawer-backdrop-out { from { background: #24334e66; backdrop-filter: blur(5px); } to { background: #24334e00; backdrop-filter: blur(0); } }
 @media(max-width:999px) {
-  .app-drawer.detail-drawer, .app-drawer.position-dialog, .app-drawer.transcript-drawer { width: min(580px, 100%); max-width: 100%; height: var(--drawer-rest-height, 84dvh); max-height: 100dvh; margin: auto auto 0; padding: 0; border: 0; border-radius: 28px 28px 0 0; background: #fff; box-shadow: 0 -16px 70px #24334e26; overflow: hidden; transition: height .3s cubic-bezier(.22,1,.36,1), border-radius .3s ease, transform .25s ease-out; }
-  .app-drawer[data-expanded="true"] { height: 100dvh; border-radius: 0; padding-top: env(safe-area-inset-top, 0px); }
+  .app-drawer.detail-drawer, .app-drawer.position-dialog, .app-drawer.transcript-drawer { position: fixed; inset: auto 0 var(--drawer-viewport-bottom, 0px); width: min(580px, 100%); max-width: 100%; height: var(--drawer-rest-height, 84dvh); max-height: var(--drawer-viewport-height, 100dvh); margin: 0 auto; padding: 0; border: 0; border-radius: 28px 28px 0 0; background: #fff; box-shadow: 0 -16px 70px #24334e26; overflow: hidden; transition: height .3s cubic-bezier(.22,1,.36,1), border-radius .3s ease, transform .25s ease-out; }
+  .app-drawer[data-expanded="true"] { height: var(--drawer-viewport-height, 100dvh); border-radius: 0; padding-top: env(safe-area-inset-top, 0px); }
   .app-drawer[data-dragging="true"] { transition: none; user-select: none; }
   .drawer-grip { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 32px; padding: 0; flex-shrink: 0; touch-action: none; cursor: grab; background: transparent; }
   .drawer-grip:active { cursor: grabbing; }
@@ -560,10 +560,25 @@ p { margin: 0; }
   .quick-detail-drawer { width: min(540px, calc(100% - 48px)); max-width: 540px; }
 }
 
-.work-reference > h3 { margin: 0; color: #576b85; font-size: 13px; font-weight: 550; line-height: 1.5; }
+.work-reference > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 36px; color: #576b85; font-size: 13px; font-weight: 550; line-height: 1.5; cursor: pointer; list-style: none; }
+.work-reference > summary::-webkit-details-marker { display: none; }
+.work-reference[open] > summary > svg { transform: rotate(180deg); }
 .app-drawer .quick-work-editor { padding-top: 18px; padding-bottom: 16px; }
 .quick-work-editor .quick-volume { margin-top: 12px; padding-top: 12px; }
 .quick-work-editor .quick-volume input { min-height: 64px; padding-top: 10px; padding-bottom: 10px; }
 .quick-work-editor .draft-edit-note { margin-top: 9px; }
 .quick-work-editor .work-reference { margin-top: 12px; padding-top: 12px; }
 .quick-work-editor .reference-grid { margin-top: 12px; gap: 12px 18px; }
+
+.rewrite-preloader > svg { align-self: center; color: #4e7df2; }
+@media(max-width:999px) {
+  .app-drawer.quick-detail-drawer[data-fullscreen="true"] { width: 100%; height: var(--drawer-viewport-height, 100dvh); max-height: var(--drawer-viewport-height, 100dvh); border-radius: 0; box-shadow: none; padding-top: env(safe-area-inset-top, 0px); transition: none; }
+  .app-drawer.quick-detail-drawer[data-fullscreen="true"] .drawer-heading { padding-top: 16px; padding-bottom: 16px; }
+  .quick-detail-drawer .quick-volume { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+  .quick-detail-drawer .quick-volume > span { margin-bottom: 0; }
+  .quick-detail-drawer .quick-volume input { min-height: 48px; padding: 8px 13px; font-size: 24px; }
+  .quick-detail-drawer .quick-volume > div { border-radius: 12px; }
+  .quick-detail-drawer .quick-volume > div > span { font-size: 14px; padding-right: 14px; }
+  .quick-detail-drawer .quick-work-position h3 { font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }
+  .quick-detail-drawer .drawer-footer { padding-top: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom, 0px)); }
+}

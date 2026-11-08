@@ -10,6 +10,7 @@ type Props = {
   label?: string;
   labelledBy?: string;
   compact?: boolean;
+  fullScreen?: boolean;
   children: ReactNode;
 };
 
@@ -39,7 +40,7 @@ function lockScroll() {
 const mobile = () => window.matchMedia('(max-width: 999px)').matches;
 const duration = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 280;
 
-export function Drawer({ open, onClose, canClose = true, className = '', id, label, labelledBy, compact, children }: Props) {
+export function Drawer({ open, onClose, canClose = true, className = '', id, label, labelledBy, compact, fullScreen = false, children }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const animation = useRef<Animation | null>(null);
   const unlock = useRef<(() => void) | null>(null);
@@ -78,7 +79,7 @@ export function Drawer({ open, onClose, canClose = true, className = '', id, lab
     setPhase('closing');
     const motion = panel.animate([
       { transform: from === 'none' ? 'translateY(0)' : from, opacity: 1 },
-      { transform: mobile() ? 'translateY(100%)' : 'translateY(16px) scale(.97)', opacity: mobile() ? 1 : 0 },
+      { transform: mobile() ? fullScreen ? 'translateY(0)' : 'translateY(100%)' : 'translateY(16px) scale(.97)', opacity: mobile() && !fullScreen ? 1 : 0 },
     ], { duration: duration(), easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' });
     animation.current = motion;
     motion.finished.then(finishClose).catch(() => {});
@@ -93,7 +94,7 @@ export function Drawer({ open, onClose, canClose = true, className = '', id, lab
       unlock.current = lockScroll();
       setPhase('opening');
       const motion = panel.animate([
-        { transform: mobile() ? 'translateY(100%)' : 'translateY(16px) scale(.97)', opacity: mobile() ? 1 : 0 },
+        { transform: mobile() ? fullScreen ? 'translateY(0)' : 'translateY(100%)' : 'translateY(16px) scale(.97)', opacity: mobile() && !fullScreen ? 1 : 0 },
         { transform: 'translateY(0)', opacity: 1 },
       ], { duration: duration(), easing: 'cubic-bezier(.22,1,.36,1)' });
       animation.current = motion;
@@ -102,6 +103,38 @@ export function Drawer({ open, onClose, canClose = true, className = '', id, lab
   }, [open]);
 
   useEffect(() => () => { animation.current?.cancel(); dialog.current?.close(); unlock.current?.(); }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const viewport = window.visualViewport;
+    const updateViewport = () => {
+      const panel = dialog.current;
+      if (!panel) return;
+      const height = viewport?.height ?? window.innerHeight;
+      const bottom = Math.max(0, window.innerHeight - height - (viewport?.offsetTop ?? 0));
+      panel.style.setProperty('--drawer-viewport-height', `${height}px`);
+      panel.style.setProperty('--drawer-viewport-bottom', `${bottom}px`);
+      const focused = document.activeElement;
+      if (focused instanceof HTMLInputElement && panel.contains(focused)) {
+        const body = focused.closest<HTMLElement>('.drawer-body');
+        if (body) {
+          const fieldBounds = focused.getBoundingClientRect();
+          const bodyBounds = body.getBoundingClientRect();
+          if (fieldBounds.bottom > bodyBounds.bottom - 12) body.scrollTop += fieldBounds.bottom - bodyBounds.bottom + 12;
+          else if (fieldBounds.top < bodyBounds.top + 12) body.scrollTop -= bodyBounds.top - fieldBounds.top + 12;
+        }
+      }
+    };
+    updateViewport();
+    viewport?.addEventListener('resize', updateViewport);
+    viewport?.addEventListener('scroll', updateViewport);
+    window.addEventListener('resize', updateViewport);
+    return () => {
+      viewport?.removeEventListener('resize', updateViewport);
+      viewport?.removeEventListener('scroll', updateViewport);
+      window.removeEventListener('resize', updateViewport);
+    };
+  }, [open]);
 
   function beginDrag(event: PointerEvent<HTMLButtonElement>) {
     if (!mobile() || closing.current || event.button !== 0 || !event.isPrimary) return;
@@ -116,7 +149,7 @@ export function Drawer({ open, onClose, canClose = true, className = '', id, lab
     if (!start) return;
     const distance = event.clientY - start.y;
     if (Math.abs(distance) > 6) dragged.current = true;
-    if (distance < 0) setDrag({ offset: 0, height: Math.min(window.innerHeight, start.height - distance) });
+    if (distance < 0) setDrag({ offset: 0, height: Math.min(window.visualViewport?.height ?? window.innerHeight, start.height - distance) });
     else setDrag({ offset: distance });
   }
 
@@ -136,10 +169,10 @@ export function Drawer({ open, onClose, canClose = true, className = '', id, lab
   } as CSSProperties;
 
   return <dialog ref={dialog} id={id} className={`app-drawer ${className}`} aria-label={label} aria-labelledby={labelledBy}
-    data-state={phase} data-expanded={expanded} data-dragging={Boolean(drag)} style={style}
+    data-state={phase} data-expanded={expanded} data-dragging={Boolean(drag)} data-fullscreen={fullScreen} style={style}
     onCancel={event => { event.preventDefault(); close(); }}
     onClick={event => { if (event.target === event.currentTarget) close(); }}>
-    <button type="button" className="drawer-grip" aria-label={expanded ? 'Свернуть панель' : 'Развернуть на весь экран'} aria-expanded={expanded}
+    {!fullScreen && <button type="button" className="drawer-grip" aria-label={expanded ? 'Свернуть панель' : 'Развернуть на весь экран'} aria-expanded={expanded}
       aria-keyshortcuts="ArrowUp ArrowDown" title="Потяните вверх, чтобы развернуть, или вниз, чтобы закрыть"
       disabled={phase === 'closing'} onPointerDown={beginDrag} onPointerMove={moveDrag} onPointerUp={endDrag}
       onPointerCancel={() => { gesture.current = null; dragged.current = true; setDrag(null); }}
@@ -147,7 +180,7 @@ export function Drawer({ open, onClose, canClose = true, className = '', id, lab
       onKeyDown={event => {
         if (event.key === 'ArrowUp') { event.preventDefault(); setExpanded(true); }
         if (event.key === 'ArrowDown') { event.preventDefault(); if (expanded) setExpanded(false); else close(); }
-      }}><span /></button>
+      }}><span /></button>}
     <div className="app-drawer-content" inert={phase === 'closing'}
       onClickCapture={event => {
         // Existing close buttons and the transcript's Done action share the exit animation.

@@ -59,6 +59,7 @@ function App() {
   const [allPositions, setAllPositions] = useState(false);
   const [emptyPicker, setEmptyPicker] = useState(false);
   const [returnToVoice, setReturnToVoice] = useState(false);
+  const [rewriting, setRewriting] = useState<'request' | 'closing' | null>(null);
   const [profilePhoto, setProfilePhoto] = useState('');
   const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [overrunReview, setOverrunReview] = useState(false);
@@ -95,6 +96,7 @@ function App() {
     `${position.name} ${position.id}`.toLocaleLowerCase().includes(search.toLocaleLowerCase().trim()));
 
   function openPicker(forNew = false) {
+    volumeInputRef.current?.blur();
     setSearch(''); setEmptyPicker(forNew); setAllPositions(forNew || Boolean(formPosition)); setPicker(true);
   }
 
@@ -174,7 +176,7 @@ function App() {
   }, [profile?.has_photo]);
 
   useEffect(() => {
-    if (selected != null && !picker && !locked) {
+    if (selected != null && !picker && !locked && window.matchMedia('(min-width: 1000px)').matches) {
       volumeInputRef.current?.focus();
       volumeInputRef.current?.select();
     }
@@ -340,12 +342,23 @@ function App() {
 
   async function overwriteDraft() {
     if (!report || locked) return;
-    setBusy(true); setError('');
+    setBusy(true); setRewriting('request'); setError('');
     try {
       accept(await request('/rewrite', 'POST', { revision: report.draft.revision }));
       setReturnToVoice(true);
-      if (telegram?.initData) telegram.close();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Не удалось перезаписать черновик'); }
+      if (telegram?.initData) {
+        setRewriting('closing');
+        // Paint the closing state before asking the host to dismiss the WebView.
+        await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        try { telegram.close(); }
+        catch { setRewriting(null); }
+        // Some hosts ignore close(); keep the Telegram return link available there.
+        window.setTimeout(() => setRewriting(null), 2000);
+      } else setRewriting(null);
+    } catch (e) {
+      setRewriting(null);
+      setError(e instanceof Error ? e.message : 'Не удалось перезаписать черновик');
+    }
     finally { setBusy(false); }
   }
 
@@ -388,6 +401,12 @@ function App() {
     } catch (e) { setError(e instanceof Error ? e.message : 'Не удалось добавить карточку'); }
     finally { setBusy(false); }
   }
+
+  if (rewriting) return <main className="return-page rewrite-preloader" role="status" aria-live="polite" aria-busy="true">
+    <LoaderCircle className="spin" size={36} aria-hidden="true" />
+    <h1>{rewriting === 'closing' ? 'Возвращаемся в Telegram…' : 'Готовим перезапись…'}</h1>
+    <p>{rewriting === 'closing' ? 'Закрываем окно отчёта.' : 'Бот готовится принять вашу голосовую команду.'}</p>
+  </main>;
 
   if (returnToVoice) return <main className="return-page">
     <img className="brand-logo" src="/assets/m100-logo.png" alt="М100 · Инженерные сети" />
@@ -494,21 +513,21 @@ function App() {
       </div>
     </Drawer>
 
-    <Drawer open={selected !== null} onClose={closeCard} canClose={!busy} className="detail-drawer quick-detail-drawer" label="Изменить объём">
+    <Drawer open={selected !== null} onClose={closeCard} canClose={!busy} className="detail-drawer quick-detail-drawer" label="Изменить объём" fullScreen>
       {form && <div className="drawer-inner"><div className="drawer-heading"><span className="card-editor-icon"><PencilLine size={21} /></span><div className="card-editor-heading"><span>{`РАБОТА ${String((selected ?? 0) + 1).padStart(2, '0')}${formPosition ? ` · ${formPosition}` : ''}`}</span><h2>Изменить объём</h2></div><button className="close-button" disabled={busy} aria-label="Закрыть карточку" onClick={closeCard}><X size={21} /></button></div>
         <div className="drawer-body quick-work-editor">
           <div className="quick-work-position"><small>{formPosition || 'Позиция не определена'}</small><h3>{form.name}</h3>{!locked && <button className="choose-position" disabled={busy} onClick={() => openPicker()}><Search size={15} />{formPosition ? 'Заменить работу' : 'Выбрать работу'}</button>}</div>
-          <label className="edit-field volume-edit quick-volume"><span>Выполненный объём</span><div><input ref={volumeInputRef} aria-label="Выполненный объём" value={form.quantity} inputMode="decimal" enterKeyHint="done" autoComplete="off" disabled={locked} placeholder="0" onChange={event => editField('quantity', event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && dirty && !locked) { event.preventDefault(); void saveCard(); } }} /><span>{form.unit}</span></div></label>
+          <label className="edit-field volume-edit quick-volume"><span>Выполненный объём</span><div><input ref={volumeInputRef} aria-label="Выполненный объём" value={form.quantity} inputMode="decimal" enterKeyHint="done" autoComplete="off" disabled={locked} placeholder="0" onFocus={event => event.currentTarget.select()} onChange={event => editField('quantity', event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && dirty && !locked) { event.preventDefault(); void saveCard(); } }} /><span>{form.unit}</span></div></label>
           <p className="draft-edit-note">«Применить» изменит черновик. Чтобы записать результат в Google Sheets и Битрикс24, нажмите «Сохранить отчёт».</p>
           {selectedLine && !formPosition && <p className="drawer-error">Выберите работу из спецификации, чтобы применить объём.</p>}
           {error && <p className="drawer-error" role="alert">{error}</p>}
-          <section className="work-reference" aria-labelledby="work-reference-title"><h3 id="work-reference-title">Информация о работе</h3><div className="reference-grid">{detailFields.map(({ key, label }) => <div key={key}><span>{label}</span><strong>{key === 'unit' ? form.unit || '—' : format(form[key])}</strong></div>)}</div></section>
+          <details className="work-reference" open={window.matchMedia('(min-width: 1000px)').matches}><summary>Информация о работе<ChevronDown size={16} aria-hidden="true" /></summary><div className="reference-grid">{detailFields.map(({ key, label }) => <div key={key}><span>{label}</span><strong>{key === 'unit' ? form.unit || '—' : format(form[key])}</strong></div>)}</div></details>
         </div>
         <div className="drawer-footer">{!saved && !cancelled && <><button className="button button-delete" disabled={locked} onClick={() => { if (selected !== null) requestDelete(selected); }}><Trash2 size={17} />Удалить</button><button className="button button-dark" disabled={locked || !dirty} onClick={saveCard}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}Применить</button></>}{(saved || cancelled) && <span className="saved-note">{saved ? 'Отчёт сохранён' : 'Черновик отменён'}</span>}</div>
       </div>}
     </Drawer>
 
-    <Drawer open={picker} onClose={() => { setPicker(false); if (selected != null && !locked) { volumeInputRef.current?.focus(); volumeInputRef.current?.select(); } }} canClose={!busy} className="position-dialog" label="Выбор позиции">
+    <Drawer open={picker} onClose={() => setPicker(false)} canClose={!busy} className="position-dialog" label="Выбор позиции">
       <div className="picker-heading"><span className="voice-block-icon"><Search size={22} /></span><div className="picker-heading-copy"><h2>Выбор работы</h2><small>{allPositions ? 'Весь список позиций' : 'Подходящие позиции'}</small></div><button className="close-button" aria-label="Закрыть поиск" onClick={() => setPicker(false)}><X size={20} /></button></div>
       <div className="picker-scope">{allPositions ? <span>Все позиции из исходной таблицы</span> : <span>Подходящие варианты для этой работы</span>}{(!allPositions || !emptyPicker) && <button className="scope-button" onClick={() => setAllPositions(!allPositions)}>{allPositions ? 'Вероятные позиции' : 'Весь список'}</button>}</div>
       <label className="search-field"><Search size={18} /><input aria-label="Поиск по названию или ID" placeholder="Название или ID…" value={search} onChange={event => setSearch(event.target.value)} /></label>
