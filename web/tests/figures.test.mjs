@@ -25,6 +25,12 @@ test('two cards for the same position share the correct cumulative remaining vol
   assert.equal(cardFigures(position, report, duplicate).remaining, 67);
 });
 
+test('account edits subtract only the account contribution from shared totals', () => {
+  const account = { ...report, draft: { ...report.draft, mode: 'replace', before: { cable: '18' }, account_before: { cable: '10' } } };
+  assert.equal(cardFigures(position, account, [{ position_id: 'cable', quantity: '7' }]).completed, 17);
+  assert.equal(cardFigures(position, account, [{ position_id: 'cable', quantity: '12' }]).completed, 22);
+});
+
 test('saved and partially saved quantities are not added a second time', () => {
   for (const current of [
     { ...report, draft: { ...report.draft, status: 'done' } },

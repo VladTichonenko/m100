@@ -155,10 +155,17 @@ class Store:
             (user_id, chat_id, spreadsheet_id, sheet_name, Jsonb(selection)),
         )
 
-    def user_operations(self, user_id: int, chat_id: int, spreadsheet_id: str) -> list[Operation]:
+    def user_operations(
+        self, user_id: int, chat_id: int | None, spreadsheet_id: str, *, day=None
+    ) -> list[Operation]:
         rows = self.db.execute(
             "SELECT o.payload,d.user_id,d.payload FROM operations o "
-            "LEFT JOIN drafts d ON d.id=o.draft_id ORDER BY o.seq DESC",
+            "LEFT JOIN drafts d ON d.id=o.draft_id "
+            "WHERE COALESCE((o.payload->>'user_id')::bigint,d.user_id)=%s "
+            "AND COALESCE(o.payload->>'spreadsheet_id','') IN ('',%s) "
+            "AND (%s::text IS NULL OR o.payload->>'day'=%s) ORDER BY o.seq DESC",
+            (user_id, spreadsheet_id, day.isoformat() if day else None,
+             day.isoformat() if day else None),
         ).fetchall()
         result = []
         for payload, owner, draft_payload in rows:
@@ -168,7 +175,9 @@ class Store:
             source_chat = op.chat_id
             if source_chat is None and draft_payload:
                 source_chat = draft_payload["chat_id"]
-            if source_chat == chat_id and op.spreadsheet_id in {"", spreadsheet_id}:
+            if (chat_id is None or source_chat == chat_id) and op.spreadsheet_id in {
+                "", spreadsheet_id
+            }:
                 result.append(op)
         return result
 
@@ -224,6 +233,16 @@ class Store:
     def active_draft(self, user_id: int) -> Draft | None:
         pending = self.pending_drafts(user_id, limit=1)
         return pending[0] if pending else None
+
+    def current_account_draft(self, user_id: int, day) -> Draft | None:
+        row = self.db.execute(
+            "SELECT payload FROM drafts WHERE user_id=%s AND "
+            "(payload->>'status'='saving' OR "
+            "(payload->>'status'='draft' AND payload->>'day'=%s)) "
+            "ORDER BY (payload->>'status'='saving') DESC,updated_at DESC,seq DESC LIMIT 1",
+            (user_id, day.isoformat()),
+        ).fetchone()
+        return Draft.model_validate(row[0]) if row else None
 
     def save_operation(self, op: Operation) -> None:
         self.db.execute(

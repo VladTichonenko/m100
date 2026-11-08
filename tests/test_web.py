@@ -8,6 +8,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from m100_bot.config import Settings
 from m100_bot.domain import Line, Position, UserError
+from m100_bot.llm import VoiceCommand
 from m100_bot.service import Reports
 from m100_bot.sheets import Snapshot
 from m100_bot.store import Store
@@ -363,6 +364,215 @@ async def test_report_polling_checks_revision_without_reading_google(editor):
     saved = await e.client.get(e.url, headers={**e.headers, "If-None-Match": etag})
     assert saved.status == 200 and saved.headers["ETag"] != etag
     assert (await saved.json())["draft"]["status"] == "done"
+
+
+async def test_old_links_open_one_accumulated_account_report_and_pending_edits(editor):
+    e = editor
+    await e.reports.confirm(e.draft)
+    e.reports.llm.extract.return_value = [
+        Line(phrase="ещё кабель", position_id="cable", quantity=4, unit="м")
+    ]
+    second = await e.reports.create(7, 7, "ещё кабель 4 метра")
+    await e.reports.confirm(second)
+    second_headers = {"Authorization": "Bearer " + e.reports.store.web_token(second)}
+    responses = [
+        await e.client.get(e.url + "/current", headers=e.headers),
+        await e.client.get(f"/api/reports/{second.id}/current", headers=second_headers),
+    ]
+    first, other = [await response.json() for response in responses]
+    assert first["account_report"] and first["draft"] == other["draft"]
+    assert first["draft"]["id"] == second.id
+    assert first["draft"]["lines"][0]["quantity"] == "14"
+    assert first["today"]["lines"][0]["quantity"] == "14"
+    assert e.quantities["cable"] == 19  # Five metres predate this account's operations.
+    assert e.reports.store.get_draft(e.draft.id, 7).lines[0].quantity == 10
+    e.reports.llm.extract.return_value[0].quantity = Decimal(2)
+    pending = await e.reports.create(7, 7, "ещё кабель 2 метра")
+    response = await e.client.get(
+        e.url + "/current", headers={**e.headers, "If-None-Match": responses[0].headers["ETag"]}
+    )
+    assert response.status == 200
+    data = await response.json()
+    assert data["draft"]["id"] == pending.id
+    assert data["draft"]["status"] == "draft"
+    assert data["draft"]["lines"][0]["quantity"] == "16"
+    assert data["draft"]["account_before"]["cable"] == "14"
+    response = await e.client.patch(
+        e.url + "/current/lines/0", headers=e.headers,
+        json={"draft_id": pending.id, "revision": data["draft"]["revision"],
+              "line": {"position_id": "cable", "quantity": "18"}},
+    )
+    assert response.status == 200
+    data = await response.json()
+    body = {"draft_id": pending.id, "revision": data["draft"]["revision"],
+            "lines": [{"position_id": "cable", "quantity": "18"}]}
+    for _ in range(2):
+        response = await e.client.post(e.url + "/current/confirm", headers=e.headers, json=body)
+        assert response.status == 200
+        assert (await response.json())["draft"]["lines"][0]["quantity"] == "18"
+    assert e.quantities["cable"] == 23
+    assert e.reports.sheets.apply.await_count == 3
+
+
+async def test_account_report_edit_and_delete_preserve_other_accounts_and_manual_values(editor):
+    e = editor
+    e.reports.settings.allowed_user_ids = "7,8"
+    await e.reports.confirm(e.draft)
+    e.reports.llm.extract.return_value = [
+        Line(phrase="кабель другого мастера", position_id="cable", quantity=3, unit="м")
+    ]
+    other = await e.reports.create(8, 8, "кабель 3 метра")
+    await e.reports.confirm(other)
+    other_url = f"/api/reports/{other.id}/current"
+    other_headers = {"Authorization": "Bearer " + e.reports.store.web_token(other)}
+    assert (await e.client.get(other_url, headers=e.headers)).status == 401
+    for url, headers, quantity in [(e.url + "/current", e.headers, "10"),
+                                   (other_url, other_headers, "3")]:
+        data = await (await e.client.get(url, headers=headers)).json()
+        assert data["draft"]["lines"][0]["quantity"] == quantity
+        assert data["today"]["lines"][0]["quantity"] == quantity
+    for desired in ["7", "0"]:
+        current = await (await e.client.get(e.url + "/current", headers=e.headers)).json()
+        response = await e.client.post(
+            e.url + "/current/edit-today", headers=e.headers,
+            json={"draft_id": current["draft"]["id"], "revision": current["draft"]["revision"]},
+        )
+        assert response.status == 200
+        draft = (await response.json())["draft"]
+        assert [line["position_id"] for line in draft["lines"]] == ["cable"]
+        if desired == "0":
+            response = await e.client.delete(
+                e.url + "/current/lines/0", headers=e.headers,
+                json={"draft_id": draft["id"], "revision": draft["revision"]},
+            )
+            assert response.status == 200
+            draft = (await response.json())["draft"]
+        response = await e.client.post(
+            e.url + "/current/confirm", headers=e.headers,
+            json={"draft_id": draft["id"], "revision": draft["revision"],
+                  "lines": [{"position_id": "cable", "quantity": desired}]},
+        )
+        assert response.status == 200
+        assert e.quantities["cable"] == Decimal(8) + Decimal(desired)
+        assert e.quantities["clamp"] == 3
+        other_current = await (await e.client.get(other_url, headers=other_headers)).json()
+        assert other_current["draft"]["lines"][0]["quantity"] == "3"
+
+
+async def test_yesterdays_link_opens_today_without_copying_old_work_or_creating_on_read(editor):
+    e = editor
+    await e.reports.confirm(e.draft)
+    e.reports.today = lambda: date(2026, 11, 6)
+    e.quantities.update(cable=Decimal(0), clamp=Decimal(0))
+    before = e.reports.store.db.execute("SELECT count(*) FROM drafts").fetchone()[0]
+    for _ in range(2):
+        response = await e.client.get(e.url + "/current", headers=e.headers)
+        assert response.status == 200
+        data = await response.json()
+        assert data["draft"]["day"] == "2026-11-06" and data["draft"]["lines"] == []
+        assert data["today"]["lines"] == []
+    assert e.reports.store.db.execute("SELECT count(*) FROM drafts").fetchone()[0] == before
+    draft = data["draft"]
+    response = await e.client.post(
+        e.url + "/current/confirm", headers=e.headers,
+        json={"draft_id": draft["id"], "revision": draft["revision"],
+              "lines": [{"position_id": "cable", "quantity": "2"}]},
+    )
+    assert response.status == 200
+    assert (await response.json())["draft"]["day"] == "2026-11-06"
+    assert e.quantities["cable"] == 2
+    original = e.reports.store.get_draft(e.draft.id, 7)
+    assert original.day == date(2026, 11, 5) and original.lines[0].quantity == 10
+
+
+async def test_account_writes_reject_a_previous_report_even_with_the_same_revision(editor):
+    e = editor
+    e.reports.cancel(e.draft)
+    newer = await e.reports.create(7, 7, "новая работа")
+    assert newer.revision == e.draft.revision - 1 == 0
+    for draft_id in [e.draft.id, None]:
+        response = await e.client.post(
+            e.url + "/current/confirm", headers=e.headers,
+            json={"draft_id": draft_id, "revision": 0,
+                  "lines": [{"position_id": "cable", "quantity": "99"}]},
+        )
+        assert response.status == 409
+    assert e.reports.store.get_draft(newer.id, 7).lines[0].quantity == 10
+    e.reports.sheets.apply.assert_not_awaited()
+
+
+async def test_account_partial_save_keeps_recorded_work_without_adding_it_twice(editor):
+    e = editor
+    response = await e.client.put(
+        e.url + "/current", headers=e.headers,
+        json={"draft_id": e.draft.id, "revision": 0, "lines": [
+            {"position_id": "cable", "quantity": "10"},
+            {"position_id": "clamp", "quantity": None},
+        ]},
+    )
+    assert response.status == 200
+    draft = e.reports.store.get_draft(e.draft.id, 7)
+    op = await e.reports.confirm(draft, ready_only=True)
+    assert op.continuation_id
+    response = await e.client.get(e.url + "/current", headers=e.headers)
+    current = (await response.json())["draft"]
+    assert current["id"] == op.continuation_id
+    assert [line["position_id"] for line in current["lines"]] == ["cable", "clamp"]
+    assert current["lines"][0]["quantity"] == "10"
+    assert current["account_before"]["cable"] == "10"
+    response = await e.client.post(
+        e.url + "/current/confirm", headers=e.headers,
+        json={"draft_id": current["id"], "revision": current["revision"], "lines": [
+            {"position_id": "cable", "quantity": "10"},
+            {"position_id": "clamp", "quantity": "4"},
+        ]},
+    )
+    assert response.status == 200
+    data = await response.json()
+    assert {line["position_id"]: line["quantity"] for line in data["draft"]["lines"]} == {
+        "cable": "10", "clamp": "4"
+    }
+    assert e.quantities == {"cable": Decimal(15), "clamp": Decimal(7)}
+    assert e.reports.sheets.apply.await_count == 2
+
+
+async def test_account_polling_avoids_google_reads_and_expired_links_cannot_open_account(editor):
+    e = editor
+    e.reports.sheets.snapshot = AsyncMock(wraps=e.reports.sheets.snapshot)
+    current_url = e.url + "/current"
+    first = await e.client.get(current_url, headers=e.headers)
+    assert first.status == 200
+    e.reports.sheets.snapshot.reset_mock()
+    response = await e.client.get(
+        current_url, headers={**e.headers, "If-None-Match": first.headers["ETag"]}
+    )
+    assert response.status == 304
+    e.reports.sheets.snapshot.assert_not_awaited()
+    e.reports.store.db.execute("UPDATE web_links SET expires_at=0")
+    assert (await e.client.get(current_url, headers=e.headers)).status == 401
+
+
+async def test_bot_edits_use_the_same_unified_line_numbers_as_the_account_website(editor):
+    e = editor
+    await e.reports.confirm(e.draft)
+    e.reports.llm.extract.return_value = [
+        Line(phrase="хомуты", position_id="clamp", quantity=2, unit="шт")
+    ]
+    pending = await e.reports.create(7, 7, "два хомута")
+    current = await (await e.client.get(e.url + "/current", headers=e.headers)).json()
+    assert [line["position_id"] for line in current["draft"]["lines"]] == ["cable", "clamp"]
+    e.reports.llm.command = AsyncMock(return_value=VoiceCommand(
+        action="edit", edits=[{"line_number": 1, "quantity": 7, "position_id": None,
+                               "remove": False}], additions="", question="",
+    ))
+    command, target = await e.reports.plan_command(7, 7, "Исправь первую работу на 7 метров")
+    model_lines = e.reports.llm.command.call_args.args[2]
+    assert [line.position_id for line in model_lines] == ["cable", "clamp"]
+    assert target.id == pending.id
+    updated = await e.reports.execute_command(target, command, "Исправь первую работу на 7 метров")
+    assert updated.lines[0].quantity == 7 and updated.lines[1].quantity == 2
+    await e.reports.confirm(updated)
+    assert e.quantities == {"cable": Decimal(12), "clamp": Decimal(5)}
 
 
 async def test_web_save_notifies_single_owner_once_even_after_retry(editor):

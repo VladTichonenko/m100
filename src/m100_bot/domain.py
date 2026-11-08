@@ -115,6 +115,8 @@ class Draft(BaseModel):
     transcript: str = ""
     # Snapshot shown to the user; confirmation must not silently rebase on newer values.
     before: dict[str, Decimal] = Field(default_factory=dict)
+    # This account's contribution before editing; before still holds shared sheet totals.
+    account_before: dict[str, Decimal] | None = None
     # Already saved by an earlier partial operation; absence is not a deletion.
     preserved_position_ids: list[str] = Field(default_factory=list)
     action: str = ""

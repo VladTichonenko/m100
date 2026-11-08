@@ -32,6 +32,7 @@ export type CardDetails = {
 };
 
 export type Report = {
+  account_report?: boolean;
   draft: {
     id: string;
     day: string;
@@ -41,6 +42,7 @@ export type Report = {
     lines: Line[];
     transcript: string;
     before: Record<string, string>;
+    account_before?: Record<string, string> | null;
   };
   catalog: Position[];
   table_url: string;

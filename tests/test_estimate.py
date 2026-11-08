@@ -28,3 +28,16 @@ def test_preview_groups_duplicate_positions_and_uses_cumulative_volume():
     draft.lines[1].deleted = True
     draft.mode = "add"
     assert estimate_warnings(draft, SimpleNamespace(positions={p.id: p})) == []
+
+
+def test_account_preview_uses_personal_baseline_with_shared_completed_volume():
+    p = Position(
+        id="cable", row=5, name="Кабель", section="ЭМ", unit="м", planned=100, completed=98
+    )
+    draft = Draft(
+        user_id=7, chat_id=7, day=date(2026, 11, 8), mode="replace",
+        before={p.id: Decimal(20)}, account_before={p.id: Decimal(10)},
+        lines=[Line(phrase="кабель", position_id=p.id, unit="м", quantity=15)],
+    )
+    warnings = estimate_warnings(draft, SimpleNamespace(positions={p.id: p}))
+    assert len(warnings) == 1 and warnings[0]["excess"] == "3"

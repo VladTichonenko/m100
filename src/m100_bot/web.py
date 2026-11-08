@@ -1,5 +1,6 @@
 """Local React editor and capability-scoped report API, running with the bot."""
 
+import json
 import logging
 from decimal import Decimal
 from hashlib import sha256
@@ -33,18 +34,21 @@ class EditLine(BaseModel):
 class Edit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=0)
+    draft_id: str | None = None
     lines: list[EditLine] = Field(max_length=40)
 
 
 class CardEdit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=0)
+    draft_id: str | None = None
     line: EditLine | None = None
 
 
 class Revision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int = Field(ge=0)
+    draft_id: str | None = None
 
 
 def create_app(
@@ -57,6 +61,9 @@ def create_app(
             return draft.chat_id
         users = reports.settings.users
         return next(iter(users)) if len(users) == 1 else draft.chat_id
+
+    def account_scope(request) -> bool:
+        return (request.match_info.route.name or "").startswith("account-")
 
     @web.middleware
     async def errors(request, handler):
@@ -99,9 +106,20 @@ def create_app(
             await reports.require_access(draft.user_id, write=write)
         except AccessDenied as exc:
             raise web.HTTPForbidden(reason=str(exc)) from None
+        if account_scope(request):
+            draft = reports.account_report(draft)
+            if write:
+                body = await request.json()
+                if not isinstance(body, dict) or body.get("draft_id") != draft.id:
+                    raise UserError("Текущий отчёт изменился. Обновите страницу перед правками.")
+                if reports.store.draft_owner(draft.id) is None:
+                    snapshot = await reports.sheets.snapshot(draft.day)
+                    draft.before = snapshot.day_values
         return draft
 
-    async def payload(draft):
+    async def payload(draft, *, account=False):
+        if account:
+            draft = reports.account_report(draft)
         principal = await reports.require_access(draft.user_id)
         snap = await reports.sheets.snapshot(draft.day)
         op = reports.store.operation_for(draft.id)
@@ -110,8 +128,11 @@ def create_app(
         today_lines = []
         total_pay = Decimal(0)
         pay_complete = True
+        account_values = {
+            line.position_id: line.quantity for line in reports.account_lines(draft.user_id, today)
+        } if account else daily.day_values
         for key, position in daily.positions.items():
-            quantity = daily.day_values.get(key, Decimal(0))
+            quantity = account_values.get(key, Decimal(0))
             if not quantity:
                 continue
             pay = quantity * position.unit_pay if position.unit_pay is not None else None
@@ -137,6 +158,7 @@ def create_app(
             else ""
         )
         return {
+            "account_report": account,
             "estimate_warnings": estimate_warnings(draft, snap)
             if not (op and op.sheets_done)
             else [],
@@ -175,6 +197,9 @@ def create_app(
             },
         }
 
+    async def response_payload(request, draft):
+        return await payload(draft, account=account_scope(request))
+
     async def avatar(request):
         draft = await authorized(request)
         profile = await telegram_profile(reports.store, draft.user_id, bot)
@@ -191,7 +216,7 @@ def create_app(
             edit = Revision.model_validate(await request.json())
             # Retrying after a lost response must not send a second invitation.
             if draft.action == "voice" and edit.revision in {draft.revision, draft.revision - 1}:
-                return web.json_response(await payload(draft))
+                return web.json_response(await response_payload(request, draft))
             if edit.revision != draft.revision:
                 raise UserError("Отчёт изменён в другом окне или боте. Обновите страницу.")
             if bot is None:
@@ -210,7 +235,7 @@ def create_app(
             draft.action = "voice"
             reports.save_edit(draft)
             reports.remember_web_state(draft)
-            return web.json_response(await payload(draft))
+            return web.json_response(await response_payload(request, draft))
 
     async def edit_today(request):
         """Open a replacement draft from current saved day totals; never write externals."""
@@ -219,6 +244,9 @@ def create_app(
             edit = Revision.model_validate(await request.json())
             if source.status != "done" or edit.revision != source.revision:
                 raise UserError("Откройте актуальный сохранённый отчёт перед исправлением.")
+            if account_scope(request):
+                draft = await reports.edit_account_today(source)
+                return web.json_response(await response_payload(request, draft))
             draft = reports.active_draft(source.user_id)
             if draft is not None:
                 if draft.mode != "replace":
@@ -232,7 +260,7 @@ def create_app(
             token = reports.store.web_token(draft)
             return web.json_response(
                 {
-                    **await payload(draft),
+                    **await response_payload(request, draft),
                     "edit_url": f"/report/{draft.id}#token={token}",
                 }
             )
@@ -262,7 +290,8 @@ def create_app(
         # Removing a previously recorded daily total must explicitly write zero.
         if draft.mode == "replace":
             kept = {line.position_id for line in lines}
-            for key, qty in draft.before.items():
+            baseline = draft.account_before if draft.account_before is not None else draft.before
+            for key, qty in baseline.items():
                 if qty and key not in kept and key not in draft.preserved_position_ids:
                     p = snap.positions.get(key)
                     if not p:
@@ -287,20 +316,20 @@ def create_app(
             draft = await authorized(request)
             op = reports.store.operation_for(draft.id)
             state = (
-                f"{draft.id}:{draft.revision}:{draft.status}:{draft.saved_notified}:"
+                json.dumps(draft.model_dump(mode="json"), sort_keys=True) + ":"
                 f"{op.sheets_done if op else None}:{op.bitrix_done if op else None}"
             )
             etag = '"' + sha256(state.encode()).hexdigest() + '"'
             headers = {"ETag": etag}
             if request.headers.get("If-None-Match") == etag:
                 return web.Response(status=304, headers=headers)
-            return web.json_response(await payload(draft), headers=headers)
+            return web.json_response(await response_payload(request, draft), headers=headers)
 
     async def edit_report(request):
         async with reports.edit_lock:
             draft = await authorized(request, write=True)
             await apply_edit(request, draft)
-            return web.json_response(await payload(draft))
+            return web.json_response(await response_payload(request, draft))
 
     async def confirm_report(request):
         async with reports.edit_lock:
@@ -314,7 +343,7 @@ def create_app(
             except UserError as exc:
                 current = reports.store.get_draft(draft.id, draft.user_id)
                 return web.json_response(
-                    {"error": str(exc), **await payload(current)},
+                    {"error": str(exc), **await response_payload(request, current)},
                     status=409,
                 )
             current = reports.store.get_draft(draft.id, draft.user_id)
@@ -336,7 +365,7 @@ def create_app(
                 else:
                     current.saved_notified = True
                     reports.store.save_draft(current)
-            return web.json_response(await payload(current))
+            return web.json_response(await response_payload(request, current))
 
     async def update_card(request):
         async with reports.edit_lock:
@@ -382,7 +411,7 @@ def create_app(
             draft.action_index = -1
             reports.save_edit(draft)
             reports.remember_web_state(draft)
-            return web.json_response(await payload(draft))
+            return web.json_response(await response_payload(request, draft))
 
     async def health(request):
         try:
@@ -408,6 +437,14 @@ def create_app(
 
         register_webhook(app, reports)
     app.router.add_get("/healthz", health)
+    current = "/api/reports/{id}/current"
+    app.router.add_get(current, get_report, name="account-report")
+    app.router.add_put(current, edit_report, name="account-edit")
+    app.router.add_post(current + "/confirm", confirm_report, name="account-confirm")
+    app.router.add_post(current + "/rewrite", rewrite_report, name="account-rewrite")
+    app.router.add_post(current + "/edit-today", edit_today, name="account-edit-today")
+    app.router.add_patch(current + "/lines/{index:\\d+}", update_card, name="account-card")
+    app.router.add_delete(current + "/lines/{index:\\d+}", update_card, name="account-delete")
     app.router.add_get("/api/reports/{id}", get_report)
     app.router.add_get("/api/reports/{id}/avatar", avatar)
     app.router.add_put("/api/reports/{id}", edit_report)

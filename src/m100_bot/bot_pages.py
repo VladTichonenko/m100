@@ -6,7 +6,7 @@ from urllib.parse import urlsplit
 from aiogram.types import InlineKeyboardButton, LinkPreviewOptions
 
 from .access import ROLE_NAMES
-from .domain import UserError, fmt
+from .domain import Draft, UserError, fmt
 from .navigation import help_page, main_keyboard
 from .service import Reports
 from .ui import keyboard, report_button, show_draft, table_button, work_keyboard
@@ -190,7 +190,12 @@ class BotPages:
             )
         elif action == "today":
             await reports.require_access(user_id, write=True)
-            draft = reports.active_draft(user_id) or await reports.create(user_id, chat_id)
+            source = (
+                reports.store.active_draft(user_id)
+                or reports.store.latest_saved_report(user_id, reports.today())
+                or Draft(user_id=user_id, chat_id=chat_id, day=reports.today())
+            )
+            draft = await reports.edit_account_today(source)
             await show_draft(message, draft, reports)
         elif action == "cancel":
             await reports.require_access(user_id, write=True)

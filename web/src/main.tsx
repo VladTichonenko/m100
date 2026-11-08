@@ -17,6 +17,7 @@ type TelegramApp = {
 const telegram = (window as Window & { Telegram?: { WebApp?: TelegramApp } }).Telegram?.WebApp;
 
 const reportId = location.pathname.match(/^\/report\/([a-zA-Z0-9_-]+)$/)?.[1];
+const reportApi = `/api/reports/${reportId}/current`;
 const tokenKey = `m100-token:${reportId}`;
 let token = '';
 try {
@@ -65,6 +66,7 @@ function App() {
   const [overrunReview, setOverrunReview] = useState(false);
   const volumeInputRef = useRef<HTMLInputElement>(null);
   const reportTag = useRef('');
+  const currentReportId = useRef('');
   const deleteDialogRef = useRef<HTMLDialogElement>(null);
   const cardPress = useRef<{ timer: number; pointerId: number; x: number; y: number } | null>(null);
   const pressConsumed = useRef(false);
@@ -101,13 +103,21 @@ function App() {
     setSearch(''); setEmptyPicker(forNew); setAllPositions(forNew || Boolean(formPosition)); setPicker(true);
   }
 
-  function accept(data: Report) { setReport(data); }
+  function accept(data: Report) {
+    if (currentReportId.current && currentReportId.current !== data.draft.id) {
+      setSelected(null); setForm(null); setDirty(false); setDeleted(null); setToast('');
+      setError('');
+      setWorkFilter('Все'); setWorkSearch('');
+    }
+    currentReportId.current = data.draft.id;
+    setReport(data);
+  }
 
   function load(data: Report) {
     accept(data);
     try {
       const cached = JSON.parse(sessionStorage.getItem(localKey) || 'null');
-      if (data.draft.status === 'draft' && cached?.revision === data.draft.revision
+      if (data.draft.status === 'draft' && cached?.draft_id === data.draft.id && cached?.revision === data.draft.revision
         && data.draft.lines[cached.index] && cached.form) {
         const line = data.draft.lines[cached.index];
         const position = data.catalog.find(item => item.id === cached.position);
@@ -126,9 +136,9 @@ function App() {
   }
 
   async function request(action = '', method = 'GET', body?: object) {
-    const response = await fetch(`/api/reports/${reportId}${action}`, {
+    const response = await fetch(`${reportApi}${action}`, {
       method, headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
+      body: body ? JSON.stringify({ ...body, draft_id: report?.draft.id }) : undefined,
     });
     const data = await response.json();
     if (!response.ok) {
@@ -164,7 +174,7 @@ function App() {
       if (stopped || inFlight || document.visibilityState !== 'visible') return;
       inFlight = true;
       try {
-        const response = await fetch(`/api/reports/${reportId}`, {
+        const response = await fetch(reportApi, {
           headers: { Authorization: `Bearer ${token}`, ...(!force && reportTag.current ? { 'If-None-Match': reportTag.current } : {}) },
         });
         if (stopped || response.status === 304 || !response.ok) return;
@@ -195,7 +205,7 @@ function App() {
     if (!report) return;
     try {
       if (dirty && form && selected != null) sessionStorage.setItem(localKey, JSON.stringify({
-        revision: report.draft.revision, index: selected, form, position: formPosition,
+        draft_id: report.draft.id, revision: report.draft.revision, index: selected, form, position: formPosition,
       }));
       else sessionStorage.removeItem(localKey);
     } catch { /* Editing still works without local storage. */ }
@@ -419,6 +429,7 @@ function App() {
     setBusy(true); setError('');
     try {
       const data = await request('/edit-today', 'POST', { revision: report.draft.revision });
+      if (data.account_report) { accept(data); setBusy(false); return; }
       if (!data.edit_url) throw new Error('Не удалось открыть исправление. Повторите ещё раз.');
       window.location.assign(data.edit_url);
     } catch (e) {

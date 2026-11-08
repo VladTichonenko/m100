@@ -773,6 +773,20 @@ async def test_starting_new_work_keeps_a_genuine_pending_report(conversation):
     c.reports.sheets.apply.assert_not_awaited()
 
 
+async def test_today_command_opens_personal_account_totals_instead_of_shared_sheet(conversation):
+    c = conversation
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    await c.reports.confirm(draft)
+    c.reports.sheets.snapshot.return_value.day_values["cable"] = 13
+    await c.send("/today")
+    current = c.reports.active_draft(7)
+    assert current.id != draft.id and current.lines[0].quantity == 10
+    assert current.before["cable"] == 13 and current.account_before["cable"] == 10
+    assert_work_links(c.session.sent[-1], c.reports, current)
+    c.llm.command.assert_not_awaited()
+    c.reports.sheets.apply.assert_awaited_once()
+
+
 async def test_format_command_works_while_manual_quantity_prompt_is_open(conversation):
     c = conversation
     draft = await c.reports.create(7, 7, "кабель")

@@ -17,7 +17,8 @@ def estimate_warnings(draft: Draft, snapshot) -> list[dict]:
     warnings = []
     for key, qty in totals.items():
         position = snapshot.positions[key]
-        delta = qty - (draft.before.get(key, Decimal(0)) if draft.mode == "replace" else 0)
+        baseline = draft.account_before if draft.account_before is not None else draft.before
+        delta = qty - (baseline.get(key, Decimal(0)) if draft.mode == "replace" else 0)
         projected = position.completed + delta
         # Correcting down an already over-budget total doesn't introduce a new excess.
         if delta <= 0 or projected <= position.planned:

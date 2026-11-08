@@ -3,6 +3,7 @@ import json
 import re
 from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
 
 from .access import BotAccess
 from .bitrix import Bitrix, daily_lines
@@ -64,6 +65,91 @@ class Reports:
             draft.status = "cancelled"
             self.save_edit(draft)
             return None
+        return draft
+
+    def account_lines(self, user_id: int, day: date) -> list[Line]:
+        """Rebuild this account's daily contributions from completed sheet writes."""
+        lines: dict[str, Line] = {}
+        operations = self.store.user_operations(
+            user_id, None, self.settings.google_spreadsheet_id, day=day
+        )
+        for op in reversed(operations):
+            if op.kind != "report" or op.day != day or not op.sheets_done:
+                continue
+            for change in op.changes:
+                previous = lines[change.position_id].quantity if change.position_id in lines else 0
+                lines[change.position_id] = Line(
+                    phrase=change.name,
+                    position_id=change.position_id,
+                    quantity=max(Decimal(0), (previous or 0) + change.after - change.before),
+                    unit=change.unit,
+                    confirmed_position=True,
+                )
+        return [line for line in lines.values() if line.quantity]
+
+    def account_report(self, source: Draft) -> Draft:
+        """Every valid link is an entry point to the owner's current daily workspace."""
+        today = self.today()
+        active = self.store.current_account_draft(source.user_id, today)
+        if active:
+            draft = active.model_copy(deep=True)
+            if draft.status == "saving":
+                return draft
+            saved = self.account_lines(source.user_id, draft.day)
+            baseline = {line.position_id: line.quantity for line in saved}
+            if draft.mode == "add" and (saved or draft.lines):
+                combined = {line.position_id: line.model_copy(deep=True) for line in saved}
+                unresolved = []
+                for line in draft.lines:
+                    if line.deleted:
+                        continue
+                    if not line.position_id or line.quantity is None or line.question:
+                        unresolved.append(line)
+                    elif line.position_id in combined:
+                        combined[line.position_id].quantity += line.quantity
+                    else:
+                        combined[line.position_id] = line
+                draft.lines = [*combined.values(), *unresolved]
+                draft.mode = "replace"
+                draft.account_before = baseline
+            elif draft.account_before is not None:
+                # Partial saves leave recorded contributions outside the remainder's lines.
+                kept = {line.position_id for line in draft.lines}
+                draft.lines = [
+                    *[line for line in saved if line.position_id not in kept], *draft.lines
+                ]
+                draft.preserved_position_ids = []
+            return draft
+        saved = self.store.latest_saved_report(source.user_id, today)
+        lines = self.account_lines(source.user_id, today)
+        if saved:
+            draft = saved.model_copy(deep=True)
+            draft.lines = lines
+            draft.mode = "replace"
+            draft.account_before = {line.position_id: line.quantity for line in lines}
+            return draft
+        key = sha256(f"{source.user_id}:{today}".encode()).hexdigest()[:20]
+        return Draft(
+            id=f"account-{key}", user_id=source.user_id, chat_id=source.chat_id, day=today,
+            lines=lines, account_before={},
+        )
+
+    async def edit_account_today(self, source: Draft) -> Draft:
+        await self.require_write(source.user_id)
+        active = self.active_draft(source.user_id)
+        if active:
+            return self.account_report(source)
+        snapshot = await self.sheets.snapshot(self.today())
+        lines = self.account_lines(source.user_id, self.today())
+        draft = Draft(
+            user_id=source.user_id, chat_id=source.chat_id, day=self.today(),
+            mode="replace" if lines else "add",
+            before=snapshot.day_values,
+            account_before={line.position_id: line.quantity for line in lines},
+            lines=lines,
+        )
+        self.store.save_draft(draft)
+        self.remember_web_state(draft)
         return draft
 
     async def create(self, user_id: int, chat_id: int, text: str | None = None) -> Draft:
@@ -160,6 +246,8 @@ class Reports:
         active = self.store.active_draft(user_id)
         latest_saved = self.store.latest_saved_report(user_id, self.today())
         draft = active
+        if active and (active.day == self.today() or active.status == "saving"):
+            draft = self.account_report(active)
         snap = snapshot or await self.sheets.snapshot(self.today())
         saved_lines = [
             Line(
@@ -218,8 +306,13 @@ class Reports:
             "report_state": {
                 "source": "database",
                 "current_lines_source": "active_draft" if active else "saved_day_totals",
-                "active_report": self.draft_context(active) if active else None,
+                "active_report": self.draft_context(draft) if active else None,
                 "latest_saved_report": self.draft_context(latest_saved) if latest_saved else None,
+                "account_report": self.draft_context(self.account_report(
+                    active or latest_saved or Draft(
+                        user_id=user_id, chat_id=chat_id, day=self.today()
+                    )
+                )),
             },
             "saved_lines": [
                 {"line_number": i + 1, **line.model_dump(mode="json")}
@@ -438,7 +531,8 @@ class Reports:
                 lines.extend(await self.llm.extract(command.additions, snap.positions))
         if draft.mode == "replace":
             kept = {line.position_id for line in lines}
-            for key, qty in draft.before.items():
+            baseline = draft.account_before if draft.account_before is not None else draft.before
+            for key, qty in baseline.items():
                 if qty and key not in kept and key not in draft.preserved_position_ids:
                     p = snap.positions.get(key)
                     if not p:
@@ -663,7 +757,12 @@ class Reports:
         for key, qty in quantities.items():
             position = snap.positions[key]
             before = draft.before.get(key, Decimal(0))
-            after = before + qty if draft.mode == "add" else qty
+            if draft.account_before is not None:
+                after = before + qty - draft.account_before.get(key, Decimal(0))
+            else:
+                after = before + qty if draft.mode == "add" else qty
+            if after < 0:
+                raise UserError("Объёмы изменились. Обновите отчёт перед сохранением.")
             changes.append(
                 Change(
                     position_id=key,
@@ -790,6 +889,14 @@ class Reports:
                     indexes = set(op.line_indexes or [])
                     before = dict(draft.before)
                     before.update({change.position_id: change.after for change in op.changes})
+                    account_before = None
+                    if draft.account_before is not None:
+                        account_before = dict(draft.account_before)
+                        for change in op.changes:
+                            key = change.position_id
+                            account_before[key] = (
+                                account_before.get(key, Decimal(0)) + change.after - change.before
+                            )
                     continuation = Draft(
                         id=op.continuation_id,
                         user_id=draft.user_id,
@@ -797,6 +904,7 @@ class Reports:
                         day=draft.day,
                         mode=draft.mode,
                         before=before,
+                        account_before=account_before,
                         transcript=draft.transcript,
                         auto_save=draft.auto_save,
                         save_color=draft.save_color,

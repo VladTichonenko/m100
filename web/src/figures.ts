@@ -6,7 +6,7 @@ export function cardFigures(position: Position, report: Report, lines: Line[]) {
     return total + (Number.isFinite(value) && value >= 0 ? value : 0);
   }, 0);
   const delta = report.draft.status === 'done' || report.draft.status === 'cancelled'
-    ? 0 : quantity - (report.draft.mode === 'replace' ? Number(report.draft.before[position.id] || 0) : 0);
+    ? 0 : quantity - (report.draft.mode === 'replace' ? Number((report.draft.account_before ?? report.draft.before)[position.id] || 0) : 0);
   // A partial operation may already have updated Sheets. Never preview its volume twice.
   const applied = report.operation?.sheets_done;
   const pendingDelta = applied ? 0 : delta;
