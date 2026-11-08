@@ -436,10 +436,28 @@ def build_router(reports: Reports) -> Router:
             )
         if voice.file_size and voice.file_size > reports.settings.voice_max_bytes:
             raise UserError("Голосовое слишком большое. Запишите сообщение короче.")
+        status = await message.answer("Слушаю")
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-            buffer = BytesIO()
-            await message.bot.download(voice, destination=buffer)
-            text = await Voice(reports.settings, reports.llm.http).transcribe(buffer.getvalue())
+            try:
+                buffer = BytesIO()
+                await message.bot.download(voice, destination=buffer)
+                text = await Voice(reports.settings, reports.llm.http).transcribe(buffer.getvalue())
+            except UserError as exc:
+                await status.edit_text(str(exc), parse_mode=None)
+                return
+            except Exception as exc:
+                logger.error("Voice transcription failed: %s", type(exc).__name__)
+                await status.edit_text(
+                    "Не удалось обработать голосовое. Попробуйте ещё раз или отправьте текст.",
+                    parse_mode=None,
+                )
+                return
+            # Even emoji occupy at most two UTF-16 units: leave room for the heading
+            # within Telegram's 4096-character limit and keep the entire transcript.
+            parts = [text[i : i + 2000] for i in range(0, len(text), 2000)]
+            await status.edit_text(f"🎙 Расшифровка:\n\n{parts[0]}", parse_mode=None)
+            for part in parts[1:]:
+                await message.answer(part, parse_mode=None)
             await process_command(message, text, voice=True)
 
     @router.message()

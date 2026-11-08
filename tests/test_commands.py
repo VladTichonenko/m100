@@ -10,7 +10,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
 from m100_bot.config import Settings
-from m100_bot.domain import Line, Position
+from m100_bot.domain import Line, Position, UserError
 from m100_bot.handlers import build_router
 from m100_bot.llm import VoiceCommand
 from m100_bot.service import Reports
@@ -56,7 +56,7 @@ class TelegramSession(BaseSession):
                 date=datetime.now(UTC),
                 chat=Chat(id=7, type="private"),
                 text=method.text,
-            )
+            ).as_(bot)
         return True
 
 
@@ -163,7 +163,7 @@ async def test_only_admin_can_open_user_management(conversation, role):
         assert message.reply_markup is None
 
 
-async def test_voice_edit_replies_once_and_remembers_transcription(conversation, monkeypatch):
+async def test_voice_edit_shows_transcription_and_remembers_it(conversation, monkeypatch):
     c = conversation
     original = await c.reports.create(7, 7, "кабель 10 метров")
     c.llm.command.return_value = VoiceCommand(
@@ -179,15 +179,32 @@ async def test_voice_edit_replies_once_and_remembers_transcription(conversation,
         additions="",
         question="",
     )
-    monkeypatch.setattr(
-        Voice, "transcribe", AsyncMock(return_value="Исправь <первый> пункт на 20 метров")
-    )
-    monkeypatch.setattr(c.bot, "download", AsyncMock())
+    text = "Исправь <первый> пункт на 20 метров"
+
+    async def transcribe(*args):
+        assert [method.text for method in c.session.sent] == ["Слушаю"]
+        assert not c.session.edited
+        return text
+
+    async def download(*args, **kwargs):
+        assert c.session.sent[0].text == "Слушаю"
+
+    monkeypatch.setattr(Voice, "transcribe", transcribe)
+    monkeypatch.setattr(c.bot, "download", download)
+
+    async def plan(*args, **kwargs):
+        assert c.session.edited[0].text == f"🎙 Расшифровка:\n\n{text}"
+        return c.llm.command.return_value
+
+    c.llm.command.side_effect = plan
     await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     messages = [method.text for method in c.session.sent]
-    assert len(messages) == 1
-    assert "20 м" in messages[0]
-    assert c.reports.store.history(7, 7)[0]["content"] == "Исправь <первый> пункт на 20 метров"
+    assert len(messages) == 2 and messages[0] == "Слушаю"
+    assert "20 м" in messages[1]
+    assert len(c.session.edited) == 1
+    assert c.session.edited[0].message_id == 1
+    assert c.session.edited[0].parse_mode is None
+    assert c.reports.store.history(7, 7)[0]["content"] == text
     assert c.session.sent[-1].reply_markup.inline_keyboard[0][0].text == "Открыть отчёт"
     assert c.reports.store.get_draft(original.id, 7).lines[0].quantity == 20
     c.reports.sheets.apply.assert_not_awaited()
@@ -201,10 +218,65 @@ async def test_ambiguous_voice_asks_once_without_creating_fake_work(conversation
     monkeypatch.setattr(Voice, "transcribe", AsyncMock(return_value="Исправь это"))
     monkeypatch.setattr(c.bot, "download", AsyncMock())
     await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
-    assert len(c.session.sent) == 1
-    assert c.session.sent[0].text == "Какую работу изменить?"
+    assert len(c.session.sent) == 2
+    assert c.session.sent[0].text == "Слушаю"
+    assert c.session.edited[0].text == "🎙 Расшифровка:\n\nИсправь это"
+    assert c.session.sent[1].text == "Какую работу изменить?"
     assert c.reports.store.active_draft(7) is None
     assert c.reports.store.history(7, 7)[0]["content"] == "Исправь это"
+
+
+@pytest.mark.parametrize("failure", ["recognition", "download"])
+async def test_voice_failure_replaces_listening_status(conversation, monkeypatch, failure):
+    c = conversation
+    transcribe = AsyncMock(side_effect=UserError("Не удалось разобрать речь."))
+    download = AsyncMock(
+        side_effect=RuntimeError("private-download-url") if failure == "download" else None
+    )
+    monkeypatch.setattr(Voice, "transcribe", transcribe)
+    monkeypatch.setattr(c.bot, "download", download)
+    await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
+    assert [m.text for m in c.session.sent] == ["Слушаю"]
+    assert len(c.session.edited) == 1
+    error = c.session.edited[0]
+    assert error.message_id == 1 and error.parse_mode is None
+    assert "Не удалось" in error.text and "private-download-url" not in error.text
+    c.llm.command.assert_not_awaited()
+    assert c.reports.store.history(7, 7) == []
+
+
+async def test_long_voice_transcript_is_shown_in_full(conversation, monkeypatch):
+    c = conversation
+    text = "Кабель <3×2,5> & 🎙 " * 250
+    monkeypatch.setattr(Voice, "transcribe", AsyncMock(return_value=text))
+    monkeypatch.setattr(c.bot, "download", AsyncMock())
+    c.llm.command.return_value = VoiceCommand(
+        action="clarify", edits=[], additions="", question="Какую работу изменить?"
+    )
+    await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 180})
+    first = c.session.edited[0]
+    transcript = [first, *c.session.sent[1:-1]]
+    assert first.message_id == 1
+    assert first.text.removeprefix("🎙 Расшифровка:\n\n") + "".join(
+        m.text for m in transcript[1:]
+    ) == text
+    assert all(len(m.text.encode("utf-16-le")) // 2 <= 4096 for m in transcript)
+    assert all(m.parse_mode is None for m in transcript)
+    assert c.llm.command.call_args.args[0] == text
+
+
+@pytest.mark.parametrize("extra", [{"duration": 181}, {"file_size": 9 * 1024 * 1024}])
+async def test_oversized_voice_is_rejected_without_listening(conversation, monkeypatch, extra):
+    c = conversation
+    download = AsyncMock()
+    monkeypatch.setattr(c.bot, "download", download)
+    await c.send(
+        voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3, **extra}
+    )
+    assert len(c.session.sent) == 1 and "Слушаю" not in c.session.sent[0].text
+    assert not c.session.edited
+    download.assert_not_awaited()
+    c.llm.command.assert_not_awaited()
 
 
 async def test_missing_parameter_is_named_with_voice_and_manual_options(conversation):
@@ -314,8 +386,8 @@ async def test_save_confirmed_yellow_returns_cells_table_and_remainder(
     op = c.reports.sheets.apply.call_args.args[0]
     assert op.highlight == "yellow" and len(op.changes) == 1
     assert c.reports.active_draft(7).lines[0].phrase == "труба"
-    assert len(c.session.sent) == 1
-    receipt = c.session.sent[0]
+    assert len(c.session.sent) == 1 + int(voice)
+    receipt = c.session.sent[-1]
     assert "жёлтым" in receipt.text
     assert "J5" in receipt.text and "Лист1" in receipt.text
     assert receipt.reply_markup.inline_keyboard[0][0].url.endswith("#gid=0&range=J5")
@@ -359,9 +431,9 @@ async def test_format_today_replies_once_without_reopening_unresolved_report(
         await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     else:
         await c.send(text)
-    assert len(c.session.sent) == 1
-    assert "синим" in c.session.sent[0].text
-    assert "наружн" not in c.session.sent[0].text and "черновик" not in c.session.sent[0].text
+    assert len(c.session.sent) == 1 + int(voice)
+    assert "синим" in c.session.sent[-1].text
+    assert "наружн" not in c.session.sent[-1].text and "черновик" not in c.session.sent[-1].text
     assert c.reports.active_draft(7) == pending
     op = c.reports.sheets.apply.call_args.args[0]
     assert op.kind == "format" and op.cells == ["J5"] and not op.changes
@@ -488,9 +560,9 @@ async def test_table_question_answers_once_with_values_and_leaves_draft_untouche
         await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     else:
         await c.send(text)
-    assert len(c.session.sent) == 1 and not c.session.documents
-    assert "100 м" in c.session.sent[0].text
-    assert "Открыть источник" == c.session.sent[0].reply_markup.inline_keyboard[0][0].text
+    assert len(c.session.sent) == 1 + int(voice) and not c.session.documents
+    assert "100 м" in c.session.sent[-1].text
+    assert "Открыть источник" == c.session.sent[-1].reply_markup.inline_keyboard[0][0].text
     assert c.reports.active_draft(7) == pending
     c.reports.sheets.snapshot.assert_awaited_once()
     c.reports.sheets.apply.assert_not_awaited()
@@ -558,8 +630,8 @@ async def test_main_menu_has_working_text_and_voice_routes(
         await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     else:
         await c.send(phrase)
-    assert len(c.session.sent) == 1
-    assert expected in c.session.sent[0].text
+    assert len(c.session.sent) == 1 + int(spoken)
+    assert expected in c.session.sent[-1].text
     c.llm.command.assert_not_awaited()
     c.reports.sheets.apply.assert_not_awaited()
 
