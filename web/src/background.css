@@ -1,0 +1,21 @@
+:root {
+  background-color: #cce8ff;
+}
+
+body {
+  isolation: isolate;
+}
+
+/* A fixed layer keeps the hills at the bottom on long reports and mobile. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: #cce8ff url('./assets/meadow-sky.webp') center bottom / cover no-repeat;
+}
+
+body:has(.report-actions)::before {
+  bottom: calc(74px + env(safe-area-inset-bottom, 0px));
+}
