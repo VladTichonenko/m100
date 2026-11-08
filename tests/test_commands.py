@@ -10,6 +10,7 @@ import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
+from aiohttp.test_utils import TestClient, TestServer
 
 from m100_bot.config import Settings
 from m100_bot.domain import Line, Position, UserError
@@ -19,6 +20,7 @@ from m100_bot.service import Reports
 from m100_bot.sheets import Snapshot
 from m100_bot.store import Store
 from m100_bot.voice import Voice
+from m100_bot.web import create_app
 
 
 def assert_work_links(message, reports, draft=None):
@@ -250,12 +252,16 @@ async def test_ambiguous_voice_asks_once_without_creating_fake_work(conversation
 
 
 @pytest.mark.parametrize("spoken", [False, True])
-@pytest.mark.parametrize("saved", [False, True])
-async def test_followup_clarification_links_to_existing_report(
-    conversation, monkeypatch, spoken, saved
+@pytest.mark.parametrize("saved,unresolved", [(False, False), (True, False), (False, True)])
+async def test_followup_clarification_uses_current_report_and_keeps_links(
+    conversation, monkeypatch, spoken, saved, unresolved
 ):
     c = conversation
     draft = await c.reports.create(7, 7, "кабель 10 метров")
+    if unresolved:
+        draft.lines[0].position_id = None
+        draft.lines[0].question = "Уточните сечение кабеля."
+        c.reports.save_edit(draft)
     if saved:
         await c.reports.confirm(draft)
         draft = c.reports.store.get_draft(draft.id, 7)
@@ -269,7 +275,14 @@ async def test_followup_clarification_links_to_existing_report(
         await c.send(voice={"file_id": "voice", "file_unique_id": "unique", "duration": 3})
     else:
         await c.send(text)
-    assert "Уточните модель" in c.session.sent[-1].text
+    assert "Уточните модель" not in c.session.sent[-1].text
+    if saved:
+        assert "сохранён" in c.session.sent[-1].text
+    elif unresolved:
+        assert "Уточните сечение кабеля" in c.session.sent[-1].text
+    else:
+        assert "10 м" in c.session.sent[-1].text
+    c.llm.command.assert_not_awaited()
     assert_work_links(c.session.sent[-1], c.reports, draft)
     assert c.reports.store.get_draft(draft.id, 7) == draft
 
@@ -656,6 +669,108 @@ async def test_context_passes_previous_command_and_result_to_next_request(conver
     assert context["recent_operations"][0]["cells"] == ["B5", "C5"]
     assert c.reports.sheets.apply.call_args.args[0].cells == ["B5", "C5"]
     assert len(c.session.sent) == 2
+
+
+@pytest.mark.parametrize(
+    "new_request", ["давай запишем новые работы", "давай запищем новые работы"]
+)
+async def test_browser_clarification_and_save_are_authoritative_for_bot(
+    conversation, tmp_path, new_request
+):
+    c = conversation
+    c.llm.extract.return_value = [
+        Line(phrase="кабель", quantity=10, candidates=["cable"], question="Какое сечение?")
+    ]
+    draft = await c.reports.create(7, 7, "кабель десять метров")
+    draft.action = "position"
+    draft.action_index = 0
+    c.reports.save_edit(draft)
+    c.reports.store.remember(7, 7, "assistant", "Какое сечение кабеля? Нужно уточнить работу.")
+    headers = {"Authorization": "Bearer " + c.reports.store.web_token(draft)}
+    url = f"/api/reports/{draft.id}"
+    c.llm.command.return_value = VoiceCommand(
+        action="clarify", edits=[], additions="", question="Какие новые работы выполнены?"
+    )
+    async with TestClient(TestServer(create_app(c.reports, tmp_path, c.bot))) as client:
+        response = await client.patch(
+            url + "/lines/0",
+            headers=headers,
+            json={
+                "revision": draft.revision,
+                "line": {"position_id": "cable", "quantity": "12,5", "phrase": "Кабель"},
+            },
+        )
+        assert response.status == 200
+        updated = await response.json()
+        current = c.reports.store.get_draft(draft.id, 7)
+        assert current.action == "" and current.action_index == -1
+        await c.reports.plan_command(7, 7, "Проверь текущие работы")
+        context = c.llm.command.call_args.kwargs["context"]
+        state = context["report_state"]["active_report"]
+        assert state["id"] == draft.id and state["revision"] == updated["draft"]["revision"]
+        assert state["lines"][0]["quantity"] == "12.5"
+        assert state["lines"][0]["question"] == ""
+        assert state["lines"][0]["position_id"] == "cable"
+        assert "обновлено на сайте" in context["history"][-1]["content"]
+
+        body = {
+            "revision": current.revision,
+            "lines": [{"position_id": "cable", "quantity": "12.5", "phrase": "Кабель"}],
+        }
+        for _ in range(2):
+            response = await client.post(url + "/confirm", headers=headers, json=body)
+            assert response.status == 200
+        assert c.reports.active_draft(7) is None
+        await c.reports.plan_command(7, 7, "Проверь сохранённый отчёт")
+        context = c.llm.command.call_args.kwargs["context"]
+        assert context["draft"]["exists"] is False
+        assert context["draft"]["status"] == "none"
+        assert context["report_state"]["active_report"] is None
+        saved = context["report_state"]["latest_saved_report"]
+        assert saved["id"] == draft.id and saved["status"] == "done"
+        assert saved["lines"][0]["quantity"] == "12.5"
+        assert saved["lines"][0]["question"] == ""
+        assert '"status": "done"' in context["history"][-1]["content"]
+        c.reports.sheets.apply.assert_awaited_once()
+
+    c.llm.command.reset_mock()
+    c.llm.extract.reset_mock()
+    await c.send(new_request)
+    assert "Предыдущий отчёт уже сохранён" in c.session.sent[-1].text
+    assert "какие новые работы" in c.session.sent[-1].text
+    assert "сечение" not in c.session.sent[-1].text
+    c.llm.command.assert_not_awaited()
+    c.llm.extract.assert_not_awaited()
+    assert c.reports.active_draft(7) is None
+    assert_work_links(c.session.sent[-1], c.reports, c.reports.store.get_draft(draft.id, 7))
+
+    await c.send("Так, ещё раз скажи, что надо уточнить?")
+    assert "сохранён" in c.session.sent[-1].text
+    assert "сечение" not in c.session.sent[-1].text
+    c.llm.command.assert_not_awaited()
+
+    c.llm.command.return_value = VoiceCommand(
+        action="add", edits=[], additions="кабель 3х2,5 4 метра", question=""
+    )
+    c.llm.extract.return_value = [
+        Line(phrase="кабель 3х2,5 4 метра", position_id="cable", quantity=4, unit="м")
+    ]
+    await c.send("Добавь кабель 3х2,5 4 метра")
+    new = c.reports.active_draft(7)
+    assert new.id != draft.id and new.mode == "add"
+    assert len(new.lines) == 1 and new.lines[0].quantity == 4
+    c.reports.sheets.apply.assert_awaited_once()
+
+
+async def test_starting_new_work_keeps_a_genuine_pending_report(conversation):
+    c = conversation
+    draft = await c.reports.create(7, 7, "кабель 10 метров")
+    before = c.reports.store.get_draft(draft.id, 7)
+    await c.send("давай запишем новые работы")
+    assert "текущему несохранённому отчёту" in c.session.sent[-1].text
+    assert c.reports.store.get_draft(draft.id, 7) == before
+    c.llm.command.assert_not_awaited()
+    c.reports.sheets.apply.assert_not_awaited()
 
 
 async def test_format_command_works_while_manual_quantity_prompt_is_open(conversation):

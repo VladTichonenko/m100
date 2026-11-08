@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 from datetime import date, datetime
 from decimal import Decimal
@@ -110,6 +111,30 @@ class Reports:
         draft.revision += 1
         self.store.save_draft(draft)
 
+    @staticmethod
+    def draft_context(draft: Draft) -> dict:
+        return {
+            "id": draft.id,
+            "revision": draft.revision,
+            "day": draft.day.isoformat(),
+            "status": draft.status,
+            "mode": draft.mode,
+            "lines": [
+                {"line_number": i + 1, **line.model_dump(mode="json")}
+                for i, line in enumerate(draft.lines)
+            ],
+        }
+
+    def remember_web_state(self, draft: Draft) -> None:
+        """Browser changes belong to the same conversation as Telegram changes."""
+        self.store.remember(
+            draft.user_id,
+            draft.chat_id,
+            "assistant",
+            "Состояние отчёта обновлено на сайте: "
+            + json.dumps(self.draft_context(draft), ensure_ascii=False),
+        )
+
     def cancel(self, draft: Draft) -> None:
         if draft.status != "draft" or self.store.operation_for(draft.id):
             raise UserError("Сохранение уже началось. Завершите его через /draft.")
@@ -132,7 +157,9 @@ class Reports:
         self, user_id: int, chat_id: int, text: str, *, snapshot: Snapshot | None = None
     ):
         # Planning a read must not expire or otherwise mutate an older draft.
-        draft = self.store.active_draft(user_id)
+        active = self.store.active_draft(user_id)
+        latest_saved = self.store.latest_saved_report(user_id, self.today())
+        draft = active
         snap = snapshot or await self.sheets.snapshot(self.today())
         saved_lines = [
             Line(
@@ -180,11 +207,19 @@ class Reports:
                 self.settings.google_sheet_name,
             ),
             "draft": {
-                "exists": self.store.active_draft(user_id) is not None,
+                "exists": active is not None,
+                "id": active.id if active else None,
+                "revision": active.revision if active else None,
                 "day": draft.day.isoformat(),
                 "auto_save": draft.auto_save,
-                "status": draft.status,
+                "status": active.status if active else "none",
                 "save_color": draft.save_color,
+            },
+            "report_state": {
+                "source": "database",
+                "current_lines_source": "active_draft" if active else "saved_day_totals",
+                "active_report": self.draft_context(active) if active else None,
+                "latest_saved_report": self.draft_context(latest_saved) if latest_saved else None,
             },
             "saved_lines": [
                 {"line_number": i + 1, **line.model_dump(mode="json")}

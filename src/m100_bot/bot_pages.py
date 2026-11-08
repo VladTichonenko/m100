@@ -160,6 +160,25 @@ class BotPages:
             await self.welcome(message, user_id)
         elif action == "open_report":
             await self.report(message, user_id)
+        elif action == "new_report":
+            await reports.require_access(user_id, write=True)
+            draft = reports.active_draft(user_id)
+            if draft and draft.status == "saving":
+                await show_draft(message, draft, reports)
+                return
+            saved = reports.store.latest_saved_report(user_id, reports.today())
+            state = (
+                "Новые работы добавлю к текущему несохранённому отчёту.\n\n"
+                if draft
+                else "Предыдущий отчёт уже сохранён.\n\n"
+                if saved
+                else ""
+            )
+            await message.answer(
+                state + "🎙 Расскажите голосом или текстом, какие новые работы выполнены "
+                "и в каком объёме.\nНапример: «Проложили кабель 3х2,5 — 15 метров».",
+                reply_markup=work_keyboard(reports, user_id),
+            )
         elif action == "drafts":
             await self.drafts(message, user_id)
         elif action == "help":

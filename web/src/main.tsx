@@ -64,6 +64,7 @@ function App() {
   const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [overrunReview, setOverrunReview] = useState(false);
   const volumeInputRef = useRef<HTMLInputElement>(null);
+  const reportTag = useRef('');
   const deleteDialogRef = useRef<HTMLDialogElement>(null);
   const cardPress = useRef<{ timer: number; pointerId: number; x: number; y: number } | null>(null);
   const pressConsumed = useRef(false);
@@ -134,6 +135,7 @@ function App() {
       if (data.draft) accept(data);
       throw new Error(data.error || 'Не удалось выполнить запрос');
     }
+    if (method === 'GET') reportTag.current = response.headers.get('ETag') || '';
     return data as Report;
   }
 
@@ -153,6 +155,41 @@ function App() {
       request().then(load).catch(e => setError(e.message || 'Сервер недоступен')).finally(() => setLoading(false));
     }
   }, []);
+
+  useEffect(() => {
+    if (!report || busy || selected !== null || picker || dirty || rewriting || returnToVoice) return;
+    let stopped = false;
+    let inFlight = false;
+    const refresh = async (force = false) => {
+      if (stopped || inFlight || document.visibilityState !== 'visible') return;
+      inFlight = true;
+      try {
+        const response = await fetch(`/api/reports/${reportId}`, {
+          headers: { Authorization: `Bearer ${token}`, ...(!force && reportTag.current ? { 'If-None-Match': reportTag.current } : {}) },
+        });
+        if (stopped || response.status === 304 || !response.ok) return;
+        const data = await response.json() as Report;
+        if (!stopped) {
+          reportTag.current = response.headers.get('ETag') || '';
+          accept(data);
+        }
+      } catch { /* Keep the current report during a temporary connection failure. */ }
+      finally { inFlight = false; }
+    };
+    const onResume = () => void refresh(true);
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 5000);
+    window.addEventListener('focus', onResume);
+    window.addEventListener('pageshow', onResume);
+    document.addEventListener('visibilitychange', onResume);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onResume);
+      window.removeEventListener('pageshow', onResume);
+      document.removeEventListener('visibilitychange', onResume);
+    };
+  }, [Boolean(report), busy, selected, picker, dirty, rewriting, returnToVoice]);
 
   useEffect(() => {
     if (!report) return;

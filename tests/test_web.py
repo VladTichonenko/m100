@@ -336,6 +336,35 @@ async def test_rewrite_requires_auth_current_revision_and_editable_report(editor
     e.bot.send_message.assert_not_awaited()
 
 
+async def test_report_polling_checks_revision_without_reading_google(editor):
+    e = editor
+    e.reports.sheets.snapshot = AsyncMock(wraps=e.reports.sheets.snapshot)
+    first = await e.client.get(e.url, headers=e.headers)
+    assert first.status == 200
+    etag = first.headers["ETag"]
+    e.reports.sheets.snapshot.reset_mock()
+    headers = {**e.headers, "If-None-Match": etag}
+    unchanged = await e.client.get(e.url, headers=headers)
+    assert unchanged.status == 304
+    e.reports.sheets.snapshot.assert_not_awaited()
+    assert (await e.client.get(e.url, headers={"If-None-Match": etag})).status == 401
+    response = await e.client.patch(
+        e.url + "/lines/0",
+        headers=e.headers,
+        json={"revision": 0, "line": {"position_id": "cable", "quantity": "12"}},
+    )
+    assert response.status == 200
+    changed = await e.client.get(e.url, headers=headers)
+    assert changed.status == 200 and changed.headers["ETag"] != etag
+    assert (await changed.json())["draft"]["lines"][0]["quantity"] == "12"
+    etag = changed.headers["ETag"]
+    current = e.reports.store.get_draft(e.draft.id, 7)
+    await e.reports.confirm(current)
+    saved = await e.client.get(e.url, headers={**e.headers, "If-None-Match": etag})
+    assert saved.status == 200 and saved.headers["ETag"] != etag
+    assert (await saved.json())["draft"]["status"] == "done"
+
+
 async def test_web_save_notifies_single_owner_once_even_after_retry(editor):
     e = editor
     e.draft.chat_id = 999  # Browser visitor/chat metadata does not select the recipient.

@@ -2,6 +2,7 @@
 
 import logging
 from decimal import Decimal
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -208,6 +209,7 @@ def create_app(
             )
             draft.action = "voice"
             reports.save_edit(draft)
+            reports.remember_web_state(draft)
             return web.json_response(await payload(draft))
 
     async def edit_today(request):
@@ -226,6 +228,7 @@ def create_app(
                     )
             else:
                 draft = await reports.create(source.user_id, source.chat_id)
+                reports.remember_web_state(draft)
             token = reports.store.web_token(draft)
             return web.json_response(
                 {
@@ -275,11 +278,23 @@ def create_app(
                     )
         draft.lines = lines
         draft.action = ""
+        draft.action_index = -1
         reports.save_edit(draft)
+        reports.remember_web_state(draft)
 
     async def get_report(request):
         async with reports.edit_lock:
-            return web.json_response(await payload(await authorized(request)))
+            draft = await authorized(request)
+            op = reports.store.operation_for(draft.id)
+            state = (
+                f"{draft.id}:{draft.revision}:{draft.status}:{draft.saved_notified}:"
+                f"{op.sheets_done if op else None}:{op.bitrix_done if op else None}"
+            )
+            etag = '"' + sha256(state.encode()).hexdigest() + '"'
+            headers = {"ETag": etag}
+            if request.headers.get("If-None-Match") == etag:
+                return web.Response(status=304, headers=headers)
+            return web.json_response(await payload(draft), headers=headers)
 
     async def edit_report(request):
         async with reports.edit_lock:
@@ -303,6 +318,8 @@ def create_app(
                     status=409,
                 )
             current = reports.store.get_draft(draft.id, draft.user_id)
+            if draft.status != "done":
+                reports.remember_web_state(current)
             if bot and not current.saved_notified:
                 try:
                     await bot.send_message(
@@ -361,7 +378,10 @@ def create_app(
                 if line.quantity is None:
                     raise UserError(line.question or "Укажите выполненный объём.")
                 draft.lines[index] = line
+            draft.action = ""
+            draft.action_index = -1
             reports.save_edit(draft)
+            reports.remember_web_state(draft)
             return web.json_response(await payload(draft))
 
     async def health(request):
